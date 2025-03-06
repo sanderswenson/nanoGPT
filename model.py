@@ -26,6 +26,65 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+class AttentionPattern(nn.Module):
+    """Base class for different attention patterns"""
+    def __init__(self, config):
+        super().__init__()
+        self.block_size = config.block_size
+        
+    def get_mask(self, T):
+        """Return the attention mask for this pattern"""
+        raise NotImplementedError
+        
+    def is_causal(self):
+        """Whether this attention pattern is causal"""
+        return False
+
+class CausalAttentionPattern(AttentionPattern):
+    def __init__(self, config):
+        super().__init__(config)
+        self.register_buffer("mask", torch.tril(torch.ones(config.block_size, config.block_size))
+                                   .view(1, 1, config.block_size, config.block_size))
+    
+    def get_mask(self, T):
+        return self.mask[:,:,:T,:T]
+    
+    def is_causal(self):
+        return True
+
+class LocalAttentionPattern(AttentionPattern):
+    def __init__(self, config):
+        super().__init__(config)
+        self.window_size = config.local_window_size
+        local_mask = torch.ones(config.block_size, config.block_size)
+        for i in range(config.block_size):
+            start = max(0, i - self.window_size)
+            end = min(config.block_size, i + self.window_size + 1)
+            local_mask[i, start:end] = 0
+        self.register_buffer("mask", local_mask.view(1, 1, config.block_size, config.block_size))
+    
+    def get_mask(self, T):
+        return self.mask[:,:,:T,:T]
+
+class AttentionGating(nn.Module):
+    """Trainable gating mechanism for multiple attention patterns"""
+    def __init__(self, config, num_patterns):
+        super().__init__()
+        self.n_embd = config.n_embd
+        
+        self.gate = nn.Sequential(
+            nn.Linear(config.n_embd * num_patterns, config.n_embd),
+            LayerNorm(config.n_embd, bias=config.bias),
+            nn.ReLU(),
+            nn.Linear(config.n_embd, num_patterns),
+            nn.Softmax(dim=-1)
+        )
+    
+    def forward(self, attention_outputs):
+        B = attention_outputs[0].size(0)
+        features = torch.cat([out.mean(dim=1) for out in attention_outputs], dim=-1)
+        return self.gate(features).unsqueeze(1)
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -75,6 +134,79 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
+class MultiAttentionWithGating(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        
+        # QKV projections
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        
+        # Parameters
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        
+        # Initialize attention patterns
+        self.attention_patterns = nn.ModuleList([
+            CausalAttentionPattern(config),
+            LocalAttentionPattern(config)
+        ])
+        
+        # Initialize gating mechanism
+        self.gating = AttentionGating(config, len(self.attention_patterns))
+        
+        # Dropouts
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        
+        # Flash attention support
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+    
+    def apply_attention(self, q, k, v, pattern, B, T):
+        """Apply attention with a specific pattern"""
+        if self.flash:
+            return torch.nn.functional.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=pattern.get_mask(T) if not pattern.is_causal() else None,
+                dropout_p=self.dropout if self.training else 0,
+                is_causal=pattern.is_causal()
+            )
+        else:
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            mask = pattern.get_mask(T)
+            att = att.masked_fill(mask == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            return att @ v
+    
+    def forward(self, x):
+        B, T, C = x.size()
+        
+        # Compute QKV
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        
+        # Apply each attention pattern
+        attention_outputs = []
+        for pattern in self.attention_patterns:
+            out = self.apply_attention(q, k, v, pattern, B, T)
+            out = out.transpose(1, 2).contiguous().view(B, T, C)
+            attention_outputs.append(out)
+        
+        # Apply gating
+        gates = self.gating(attention_outputs)
+        
+        # Combine outputs
+        combined = sum(g * out for g, out in zip(gates.chunk(len(self.attention_patterns), dim=-1), 
+                                               attention_outputs))
+        
+        # Final projection
+        return self.resid_dropout(self.c_proj(combined))
+
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -96,7 +228,7 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+        self.attn = MultiAttentionWithGating(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
@@ -114,6 +246,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    local_window_size: int = 128  # Size of the local attention window
 
 class GPT(nn.Module):
 
@@ -177,6 +310,12 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+
+        #I want to add compressed attention head to the model.
+        #In order to do this, we need to compress the blocks and include a position embedding for the compressed blocks
+        #this will run on a seperate, compressed attention head.
+        #The compressed head will only need to be computed once per block, and then added to the main attention head.
+
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
