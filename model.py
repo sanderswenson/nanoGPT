@@ -39,6 +39,8 @@ class AttentionPattern(nn.Module):
     def is_causal(self):
         """Whether this attention pattern is causal"""
         return False
+    
+
 
 class CausalAttentionPattern(AttentionPattern):
     def __init__(self, config):
@@ -123,11 +125,16 @@ class CausalSelfAttention(nn.Module):
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
             # manual implementation of attention
+            # (B, nh, T, hs) @ (B, nh, hs, T) -> (B, nh, T, T)
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            # mask future positions (B, nh, T, T) with -inf
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            # normalize attention weights (B, nh, T, T)
             att = F.softmax(att, dim=-1)
+            # dropout on attention matrix
             att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+            # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
+            y = att @ v
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
@@ -138,6 +145,9 @@ class MultiAttentionWithGating(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
+        
+        # Store config
+        self.config = config
         
         # QKV projections
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
@@ -150,12 +160,13 @@ class MultiAttentionWithGating(nn.Module):
         
         # Initialize attention patterns
         self.attention_patterns = nn.ModuleList([
-            CausalAttentionPattern(config),
+            # CausalAttentionPattern(config),
             LocalAttentionPattern(config)
         ])
-        
+        self.compression_ratio = config.compression_ratio
+        self.compression_mlp = CompressionMLP(config)
         # Initialize gating mechanism
-        self.gating = AttentionGating(config, len(self.attention_patterns))
+        self.gating = AttentionGating(config, len(self.attention_patterns)+1)
         
         # Dropouts
         self.attn_dropout = nn.Dropout(config.dropout)
@@ -164,14 +175,14 @@ class MultiAttentionWithGating(nn.Module):
         # Flash attention support
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
     
-    def apply_attention(self, q, k, v, pattern, B, T):
+    def apply_attention(self, q, k, v, pattern, B, T, is_causal=False):
         """Apply attention with a specific pattern"""
         if self.flash:
             return torch.nn.functional.scaled_dot_product_attention(
                 q, k, v,
-                attn_mask=pattern.get_mask(T) if not pattern.is_causal() else None,
+                attn_mask=pattern.get_mask(T) if not is_causal else None,
                 dropout_p=self.dropout if self.training else 0,
-                is_causal=pattern.is_causal()
+                is_causal=is_causal
             )
         else:
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -189,23 +200,85 @@ class MultiAttentionWithGating(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+
+        # Compress k and v for compressed attention
+        k_compressed = self.compression_mlp(k)  # [B, nh, T//ratio, hs]
+        v_compressed = self.compression_mlp(v)  # [B, nh, T//ratio, hs]
         
         # Apply each attention pattern
         attention_outputs = []
         for pattern in self.attention_patterns:
-            out = self.apply_attention(q, k, v, pattern, B, T)
+            out = self.apply_attention(q, k, v, pattern, B, T, is_causal=pattern.is_causal())
             out = out.transpose(1, 2).contiguous().view(B, T, C)
-            attention_outputs.append(out)
+            attention_outputs.append(out)  # [B, T, C]
+        
+        # Apply compressed attention
+        compressed_out = self.apply_attention(q, k_compressed, v_compressed, 
+                                           None, 
+                                           B, T//self.compression_ratio, is_causal=True)
+        compressed_out = compressed_out.transpose(1, 2).contiguous().view(B, T, C)
+        attention_outputs.append(compressed_out)
         
         # Apply gating
-        gates = self.gating(attention_outputs)
+        gates = self.gating(attention_outputs)  # Now all outputs are [B, T, C]
         
         # Combine outputs
-        combined = sum(g * out for g, out in zip(gates.chunk(len(self.attention_patterns), dim=-1), 
+        combined = sum(g * out for g, out in zip(gates.chunk(len(attention_outputs), dim=-1), 
                                                attention_outputs))
         
         # Final projection
         return self.resid_dropout(self.c_proj(combined))
+    
+class CompressionMLP(nn.Module):
+    """MLP for compressing key and value sequences in the temporal dimension while preserving head structure"""
+    def __init__(self, config):
+        super().__init__()
+        self.compression_ratio = config.compression_ratio
+        self.n_head = config.n_head
+        self.head_size = config.n_embd // config.n_head
+        
+        # Simple position embeddings for intra-block positions
+        self.pos_emb = nn.Embedding(config.block_size, self.head_size)
+        
+        # Compression MLP to process each block
+        self.c_fc = nn.Linear(self.head_size * self.compression_ratio, 4 * self.head_size, bias=config.bias)
+        self.gelu = nn.GELU()
+        self.c_proj = nn.Linear(4 * self.head_size, self.head_size, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+        self.ln = LayerNorm(self.head_size, bias=config.bias)
+
+    def forward(self, x):
+        # x shape: (B, nh, T, hs)
+        B, nh, T, hs = x.size()
+        
+        # Handle padding if needed
+        if T % self.compression_ratio != 0:
+            padding = self.compression_ratio - (T % self.compression_ratio)
+            x = F.pad(x, (0, 0, 0, padding))
+            T = T + padding
+        
+        # Reshape into blocks
+        x = x.view(B, nh, T // self.compression_ratio, self.compression_ratio, hs)
+        
+        # Add position information directly
+        pos = torch.arange(0, self.compression_ratio, device=x.device)
+        pos_emb = self.pos_emb(pos).view(1, 1, 1, self.compression_ratio, hs)
+        x = x + pos_emb  # Broadcasting handles the rest
+        
+        # Make contiguous before reshaping
+        x = x.contiguous()
+        
+        # Merge tokens in each block
+        x = x.view(B, nh, T // self.compression_ratio, self.compression_ratio * hs)
+        
+        # Apply compression MLP
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        x = self.dropout(x)
+        x = self.ln(x)
+        
+        return x  # (B, nh, T//compression_ratio, hs)
 
 class MLP(nn.Module):
 
@@ -228,7 +301,7 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = MultiAttentionWithGating(config)
+        self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
@@ -247,6 +320,7 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     local_window_size: int = 128  # Size of the local attention window
+    compression_ratio: int = 2  # Added for the new CompressionMLP
 
 class GPT(nn.Module):
 
@@ -310,11 +384,6 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-
-        #I want to add compressed attention head to the model.
-        #In order to do this, we need to compress the blocks and include a position embedding for the compressed blocks
-        #this will run on a seperate, compressed attention head.
-        #The compressed head will only need to be computed once per block, and then added to the main attention head.
 
         for block in self.transformer.h:
             x = block(x)
