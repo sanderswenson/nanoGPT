@@ -301,7 +301,7 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+        self.attn = MultiAttentionWithGating(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
@@ -320,7 +320,7 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     local_window_size: int = 128  # Size of the local attention window
-    compression_ratio: int = 2  # Added for the new CompressionMLP
+    compression_ratio: int = 64  # Added for the new CompressionMLP
 
 class GPT(nn.Module):
 

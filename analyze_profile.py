@@ -3,38 +3,69 @@ Script to analyze PyTorch profiler results and display key metrics
 """
 
 import os
+import json
 import pandas as pd
+import argparse
 from torch.profiler import profile
 import torch
 
-def load_and_analyze_profile(profile_path):
+def load_and_analyze_profile(profile_path, specific_file=None):
     """Load and analyze the profiling data"""
     print("=== PyTorch Profiler Analysis ===\n")
     
     # Load the profiling data
-    events_df = pd.DataFrame()
-    for root, dirs, files in os.walk(profile_path):
-        for file in files:
-            if file.endswith('.pt.trace.json'):
-                trace_path = os.path.join(root, file)
-                df = pd.read_json(trace_path)
-                events_df = pd.concat([events_df, df])
+    events = []
+    if specific_file:
+        # Handle single file
+        if os.path.exists(specific_file):
+            with open(specific_file, 'r') as f:
+                trace_data = json.load(f)
+                if 'traceEvents' in trace_data:
+                    for event in trace_data['traceEvents']:
+                        if 'cat' in event and 'dur' in event:
+                            events.append({
+                                'name': event.get('name', ''),
+                                'category': event.get('cat', ''),
+                                'duration_us': event.get('dur', 0),
+                                'ts': event.get('ts', 0),
+                                'args': event.get('args', {})
+                            })
+        else:
+            print(f"Specified file {specific_file} does not exist!")
+            return
+    else:
+        # Handle directory
+        for root, dirs, files in os.walk(profile_path):
+            for file in files:
+                if file.endswith('.pt.trace.json'):
+                    trace_path = os.path.join(root, file)
+                    with open(trace_path, 'r') as f:
+                        trace_data = json.load(f)
+                        if 'traceEvents' in trace_data:
+                            for event in trace_data['traceEvents']:
+                                if 'cat' in event and 'dur' in event:
+                                    events.append({
+                                        'name': event.get('name', ''),
+                                        'category': event.get('cat', ''),
+                                        'duration_us': event.get('dur', 0),
+                                        'ts': event.get('ts', 0),
+                                        'args': event.get('args', {})
+                                    })
     
-    if events_df.empty:
+    if not events:
         print("No profiling data found!")
         return
     
+    # Convert to DataFrame
+    events_df = pd.DataFrame(events)
+    
     # Group by name and calculate statistics
     stats = events_df.groupby('name').agg({
-        'dur': ['count', 'mean', 'sum'],
-        'cpu_memory_usage': ['mean', 'max'],
-        'cuda_memory_usage': ['mean', 'max']
+        'duration_us': ['count', 'mean', 'sum']
     }).round(2)
     
-    # Rename columns
-    stats.columns = ['count', 'avg_duration_us', 'total_duration_us', 
-                    'avg_cpu_mem_bytes', 'max_cpu_mem_bytes',
-                    'avg_cuda_mem_bytes', 'max_cuda_mem_bytes']
+    # Flatten column names
+    stats.columns = ['count', 'avg_duration_us', 'total_duration_us']
     
     # Sort by total duration
     stats = stats.sort_values('total_duration_us', ascending=False)
@@ -43,39 +74,49 @@ def load_and_analyze_profile(profile_path):
     stats['avg_duration_ms'] = stats['avg_duration_us'] / 1000
     stats['total_duration_ms'] = stats['total_duration_us'] / 1000
     
-    # Convert bytes to MB for better readability
-    for col in ['avg_cpu_mem_bytes', 'max_cpu_mem_bytes', 
-                'avg_cuda_mem_bytes', 'max_cuda_mem_bytes']:
-        stats[col.replace('bytes', 'MB')] = stats[col] / (1024 * 1024)
-    
     # Print summary
-    print("Top 10 Most Time-Consuming Operations:")
+    print("Top 20 Most Time-Consuming Operations:")
     print("=====================================")
-    summary = stats[['count', 'avg_duration_ms', 'total_duration_ms']].head(10)
+    summary = stats[['count', 'avg_duration_ms', 'total_duration_ms']].head(20)
     print(summary.to_string())
     print("\n")
     
-    print("Memory Usage (Top 10 by CUDA memory):")
-    print("====================================")
-    memory = stats[['avg_cpu_mem_MB', 'max_cpu_mem_MB', 
-                   'avg_cuda_mem_MB', 'max_cuda_mem_MB']].head(10)
-    print(memory.to_string())
-    print("\n")
-    
     # Calculate total time spent in each major phase
-    phases = ['forward', 'backward', 'optimizer_step', 'get_batch']
+    phases = ['forward', 'backward', 'optimizer_step', 'get_batch', 'train_step', 'evaluation']
     print("Time Spent in Major Phases:")
     print("==========================")
     for phase in phases:
-        phase_data = stats.loc[phase] if phase in stats.index else None
-        if phase_data is not None:
-            print(f"{phase:15s}: {phase_data['total_duration_ms']:10.2f} ms "
-                  f"(avg: {phase_data['avg_duration_ms']:10.2f} ms, "
-                  f"count: {phase_data['count']})")
+        phase_data = stats.loc[stats.index.str.contains(phase, case=False)] if not stats.empty else None
+        if phase_data is not None and not phase_data.empty:
+            total_time = phase_data['total_duration_ms'].sum()
+            avg_time = phase_data['avg_duration_ms'].mean()
+            total_count = phase_data['count'].sum()
+            print(f"{phase:15s}: {total_time:10.2f} ms "
+                  f"(avg: {avg_time:10.2f} ms, "
+                  f"count: {total_count})")
+    
+    # Print operation categories if available
+    if 'category' in events_df.columns:
+        print("\nTime by Operation Category:")
+        print("==========================")
+        cat_stats = events_df.groupby('category').agg({
+            'duration_us': ['count', 'mean', 'sum']
+        }).round(2)
+        cat_stats.columns = ['count', 'avg_duration_us', 'total_duration_us']
+        cat_stats['total_duration_ms'] = cat_stats['total_duration_us'] / 1000
+        cat_stats['avg_duration_ms'] = cat_stats['avg_duration_us'] / 1000
+        print(cat_stats[['count', 'avg_duration_ms', 'total_duration_ms']].sort_values('total_duration_ms', ascending=False).to_string())
 
 if __name__ == "__main__":
-    profile_path = "./log/pytorch_profiler"
-    if not os.path.exists(profile_path):
-        print(f"Profile directory {profile_path} does not exist!")
+    parser = argparse.ArgumentParser(description='Analyze PyTorch profiler output')
+    parser.add_argument('--file', type=str, help='Specific trace file to analyze')
+    args = parser.parse_args()
+
+    if args.file:
+        load_and_analyze_profile(None, specific_file=args.file)
     else:
-        load_and_analyze_profile(profile_path) 
+        profile_path = "./log/pytorch_profiler"
+        if not os.path.exists(profile_path):
+            print(f"Profile directory {profile_path} does not exist!")
+        else:
+            load_and_analyze_profile(profile_path) 
