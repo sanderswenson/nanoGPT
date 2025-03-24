@@ -12,3 +12,4 @@ env/
 venv/
 nanoGPT-env/
 data/
+log/
