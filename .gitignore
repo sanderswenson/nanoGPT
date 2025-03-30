@@ -13,3 +13,4 @@ venv/
 nanoGPT-env/
 data/
 log/pytorch_profiler/
+*.pt.trace.json
