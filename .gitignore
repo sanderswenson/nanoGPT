@@ -12,4 +12,4 @@ env/
 venv/
 nanoGPT-env/
 data/
-log/
+log/pytorch_profiler/
