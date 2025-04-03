@@ -157,13 +157,14 @@ class MultiAttentionWithGating(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.block_length = config.block_length
+        self.stride_length = config.stride_length
         
         # Initialize attention patterns
         self.attention_patterns = nn.ModuleList([
             # CausalAttentionPattern(config),
             LocalAttentionPattern(config)
         ])
-        self.compression_ratio = config.compression_ratio
         self.compression_mlp = CompressionMLP(config)
         # Initialize gating mechanism
         self.gating = AttentionGating(config, len(self.attention_patterns)+1)
@@ -175,7 +176,7 @@ class MultiAttentionWithGating(nn.Module):
         # Flash attention support
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
     
-    def apply_attention(self, q, k, v, pattern, B, T, is_causal=False):
+    def apply_attention(self, q, k, v, pattern, T, compressed_T=None, is_causal=False):
         """Apply attention with a specific pattern"""
         if self.flash:
             return torch.nn.functional.scaled_dot_product_attention(
@@ -186,8 +187,14 @@ class MultiAttentionWithGating(nn.Module):
             )
         else:
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            mask = pattern.get_mask(T)
-            att = att.masked_fill(mask == 0, float('-inf'))
+            if pattern is not None:
+                mask = pattern.get_mask(T)
+                att = att.masked_fill(mask == 0, float('-inf'))
+            elif is_causal:
+                # For causal attention with possibly different sequence lengths
+                actual_T = compressed_T or T
+                causal_mask = torch.tril(torch.ones(T, actual_T, device=q.device)).view(1, 1, T, actual_T)
+                att = att.masked_fill(causal_mask == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             return att @ v
@@ -201,21 +208,24 @@ class MultiAttentionWithGating(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        # Compress k and v for compressed attention
-        k_compressed = self.compression_mlp(k)  # [B, nh, T//ratio, hs]
-        v_compressed = self.compression_mlp(v)  # [B, nh, T//ratio, hs]
+        # Compress k and v using sliding window approach
+        k_compressed = self.compression_mlp(k)  # [B, nh, num_blocks, hs]
+        v_compressed = self.compression_mlp(v)  # [B, nh, num_blocks, hs]
+        
+        # Calculate number of blocks after compression
+        num_blocks = max(1, (T - self.block_length) // self.stride_length + 1)
         
         # Apply each attention pattern
         attention_outputs = []
         for pattern in self.attention_patterns:
-            out = self.apply_attention(q, k, v, pattern, B, T, is_causal=pattern.is_causal())
+            out = self.apply_attention(q, k, v, pattern, T, is_causal=pattern.is_causal())
             out = out.transpose(1, 2).contiguous().view(B, T, C)
             attention_outputs.append(out)  # [B, T, C]
         
         # Apply compressed attention
         compressed_out = self.apply_attention(q, k_compressed, v_compressed, 
                                            None, 
-                                           B, T//self.compression_ratio, is_causal=True)
+                                           T, compressed_T=num_blocks, is_causal=True)
         compressed_out = compressed_out.transpose(1, 2).contiguous().view(B, T, C)
         attention_outputs.append(compressed_out)
         
@@ -230,10 +240,11 @@ class MultiAttentionWithGating(nn.Module):
         return self.resid_dropout(self.c_proj(combined))
     
 class CompressionMLP(nn.Module):
-    """MLP for compressing key and value sequences in the temporal dimension while preserving head structure"""
+    """MLP for compressing key and value sequences in the temporal dimension using a sliding window approach"""
     def __init__(self, config):
         super().__init__()
-        self.compression_ratio = config.compression_ratio
+        self.block_length = config.block_length
+        self.stride_length = config.stride_length
         self.n_head = config.n_head
         self.head_size = config.n_embd // config.n_head
         
@@ -241,7 +252,7 @@ class CompressionMLP(nn.Module):
         self.pos_emb = nn.Embedding(config.block_size, self.head_size)
         
         # Compression MLP to process each block
-        self.c_fc = nn.Linear(self.head_size * self.compression_ratio, 4 * self.head_size, bias=config.bias)
+        self.c_fc = nn.Linear(self.head_size * self.block_length, 4 * self.head_size, bias=config.bias)
         self.gelu = nn.GELU()
         self.c_proj = nn.Linear(4 * self.head_size, self.head_size, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
@@ -251,34 +262,49 @@ class CompressionMLP(nn.Module):
         # x shape: (B, nh, T, hs)
         B, nh, T, hs = x.size()
         
-        # Handle padding if needed
-        if T % self.compression_ratio != 0:
-            padding = self.compression_ratio - (T % self.compression_ratio)
-            x = F.pad(x, (0, 0, 0, padding))
-            T = T + padding
+        # Determine the number of blocks after sliding window
+        num_blocks = max(1, (T - self.block_length) // self.stride_length + 1)
         
-        # Reshape into blocks
-        x = x.view(B, nh, T // self.compression_ratio, self.compression_ratio, hs)
+        # Prepare output tensor for compressed representations
+        compressed = []
         
-        # Add position information directly
-        pos = torch.arange(0, self.compression_ratio, device=x.device)
-        pos_emb = self.pos_emb(pos).view(1, 1, 1, self.compression_ratio, hs)
-        x = x + pos_emb  # Broadcasting handles the rest
+        # Apply sliding window and compress each block
+        for i in range(num_blocks):
+            # Get the current block
+            start_idx = i * self.stride_length
+            end_idx = min(start_idx + self.block_length, T)
+            
+            # Handle the case where the final block is smaller than block_length
+            actual_block_length = end_idx - start_idx
+            
+            if actual_block_length < self.block_length:
+                # Pad the block to block_length
+                padding_size = self.block_length - actual_block_length
+                block = F.pad(x[:, :, start_idx:end_idx, :], (0, 0, 0, padding_size))
+            else:
+                block = x[:, :, start_idx:end_idx, :]
+            
+            # Add position embeddings to tokens within the block
+            pos = torch.arange(0, self.block_length, device=x.device)
+            pos_emb = self.pos_emb(pos).view(1, 1, self.block_length, hs)
+            block = block + pos_emb  # Broadcasting handles dimensions
+            
+            # Reshape for MLP processing
+            block = block.reshape(B, nh, self.block_length * hs)
+            
+            # Apply compression MLP
+            block_compressed = self.c_fc(block)
+            block_compressed = self.gelu(block_compressed)
+            block_compressed = self.c_proj(block_compressed)
+            block_compressed = self.dropout(block_compressed)
+            block_compressed = self.ln(block_compressed)
+            
+            compressed.append(block_compressed)
         
-        # Make contiguous before reshaping
-        x = x.contiguous()
+        # Stack all compressed representations
+        compressed = torch.stack(compressed, dim=2)  # [B, nh, num_blocks, hs]
         
-        # Merge tokens in each block
-        x = x.view(B, nh, T // self.compression_ratio, self.compression_ratio * hs)
-        
-        # Apply compression MLP
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        x = self.ln(x)
-        
-        return x  # (B, nh, T//compression_ratio, hs)
+        return compressed  # (B, nh, num_blocks, hs)
 
 class MLP(nn.Module):
 
@@ -320,7 +346,8 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     local_window_size: int = 128  # Size of the local attention window
-    compression_ratio: int = 64  # Added for the new CompressionMLP
+    block_length: int = 64  # Length of each block for sliding window compression
+    stride_length: int = 32  # Stride between consecutive blocks for sliding window compression
 
 class GPT(nn.Module):
 
