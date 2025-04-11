@@ -58,15 +58,25 @@ class LocalAttentionPattern(AttentionPattern):
     def __init__(self, config):
         super().__init__(config)
         self.window_size = config.local_window_size
-        local_mask = torch.ones(config.block_size, config.block_size)
+        # Start with all zeros (mask everything initially)
+        local_mask = torch.zeros(config.block_size, config.block_size)
+        # Set positions WITHIN the CAUSAL window to ONE (allow attention)
         for i in range(config.block_size):
             start = max(0, i - self.window_size)
-            end = min(config.block_size, i + self.window_size + 1)
-            local_mask[i, start:end] = 0
+            # End is i+1 to include the current token i
+            end = i + 1
+            # Ensure start and end are within bounds for assignment
+            if start < end:
+              local_mask[i, start:end] = 1
+        # Register the mask (which has ONEs inside the causal window, ZEROs outside)
         self.register_buffer("mask", local_mask.view(1, 1, config.block_size, config.block_size))
-    
+
     def get_mask(self, T):
         return self.mask[:,:,:T,:T]
+
+    def is_causal(self):
+        # This pattern is now causal
+        return True
 
 class AttentionGating(nn.Module):
     """Trainable gating mechanism for multiple attention patterns"""
@@ -167,7 +177,7 @@ class MultiAttentionWithGating(nn.Module):
         ])
         self.compression_mlp = CompressionMLP(config)
         # Initialize gating mechanism
-        self.gating = AttentionGating(config, len(self.attention_patterns)+1)
+        self.gating = AttentionGating(config, len(self.attention_patterns))
         
         # Dropouts
         self.attn_dropout = nn.Dropout(config.dropout)
@@ -178,20 +188,44 @@ class MultiAttentionWithGating(nn.Module):
     
     def apply_attention(self, q, k, v, pattern, T, compressed_T=None, is_causal=False):
         """Apply attention with a specific pattern"""
+
+        # DEBUG: Check if flash is active - REMOVED
+        # print(f"Inside apply_attention: self.flash = {self.flash}")
+
+        # Determine if we should force the non-flash path for this specific pattern - REMOVED
+        # force_non_flash = isinstance(pattern, LocalAttentionPattern)
+
+        # Original logic, relying on pattern.is_causal() and self.flash
         if self.flash:
+            # print("Using Flash Attention path") # DEBUG REMOVED
+            attn_mask = None # Default for causal or no mask
+            pattern_mask = pattern.get_mask(T) if pattern is not None else None
+
+            if is_causal:
+                 # Let flash handle causality if is_causal=True
+                 pass # attn_mask remains None
+            elif pattern_mask is not None:
+                 # If pattern exists and is_causal=False (e.g., a future non-causal pattern)
+                 # Convert 0/1 mask to 0.0/-inf float mask.
+                 attn_mask = pattern_mask.float().masked_fill(pattern_mask == 0, float('-inf'))
+            # Else: No pattern and not is_causal, attn_mask remains None (full attention)
+
             return torch.nn.functional.scaled_dot_product_attention(
                 q, k, v,
-                attn_mask=pattern.get_mask(T) if not is_causal else None,
+                attn_mask=attn_mask, # Use the processed mask or None
                 dropout_p=self.dropout if self.training else 0,
-                is_causal=is_causal
+                is_causal=is_causal # Pass the flag indicating if the overall call should be causal
             )
         else:
+            # Use non-flash path if flash not available
+            # print("Using Non-Flash Attention path") # DEBUG REMOVED
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             if pattern is not None:
                 mask = pattern.get_mask(T)
+                # Non-flash path correctly handles 0/1 mask with masked_fill
                 att = att.masked_fill(mask == 0, float('-inf'))
             elif is_causal:
-                # For causal attention with possibly different sequence lengths
+                # Manual causal mask for non-flash (used if pattern is None but is_causal=True)
                 actual_T = compressed_T or T
                 causal_mask = torch.tril(torch.ones(T, actual_T, device=q.device)).view(1, 1, T, actual_T)
                 att = att.masked_fill(causal_mask == 0, float('-inf'))
@@ -218,23 +252,34 @@ class MultiAttentionWithGating(nn.Module):
         # Apply each attention pattern
         attention_outputs = []
         for pattern in self.attention_patterns:
+            # DEBUG: Print mask for LocalAttentionPattern - REMOVED
+            # if isinstance(pattern, LocalAttentionPattern):
+            #     mask = pattern.get_mask(T)
+            #     print(f"LocalAttentionPattern mask shape: {mask.shape}")
+            #     print(f"LocalAttentionPattern mask sample (first 5x5):\n{mask[0,0,:5,:5]}")
+
+            # Pass pattern.is_causal() to the apply_attention function
             out = self.apply_attention(q, k, v, pattern, T, is_causal=pattern.is_causal())
             out = out.transpose(1, 2).contiguous().view(B, T, C)
             attention_outputs.append(out)  # [B, T, C]
+
+            # DEBUG: Print output of LocalAttentionPattern - REMOVED
+            # if isinstance(pattern, LocalAttentionPattern):
+            #     print(f"LocalAttentionPattern output shape: {out.shape}")
+            #     print(f"LocalAttentionPattern output sample (first 5 tokens, first 5 features):\n{out[0,:5,:5]}")
         
         # Apply compressed attention
-        compressed_out = self.apply_attention(q, k_compressed, v_compressed, 
-                                           None, 
-                                           T, compressed_T=num_blocks, is_causal=True)
-        compressed_out = compressed_out.transpose(1, 2).contiguous().view(B, T, C)
-        attention_outputs.append(compressed_out)
+        # compressed_out = self.apply_attention(q, k_compressed, v_compressed, 
+        #                                    None, 
+        #                                    T, compressed_T=num_blocks, is_causal=True)
+        # compressed_out = compressed_out.transpose(1, 2).contiguous().view(B, T, C)
+        # attention_outputs.append(compressed_out)
         
-        # Apply gating
-        gates = self.gating(attention_outputs)  # Now all outputs are [B, T, C]
-        
-        # Combine outputs
-        combined = sum(g * out for g, out in zip(gates.chunk(len(attention_outputs), dim=-1), 
-                                               attention_outputs))
+        # DEBUG: Temporarily disable gating
+        # gates = self.gating(attention_outputs)  # Now all outputs are [B, T, C]
+        # combined = sum(g * out for g, out in zip(gates.chunk(len(attention_outputs), dim=-1), 
+        #                                        attention_outputs))
+        combined = attention_outputs[0] # Still using only the first pattern output (LocalAttentionPattern)
         
         # Final projection
         return self.resid_dropout(self.c_proj(combined))
