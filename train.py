@@ -30,6 +30,9 @@ import torch.profiler
 from torch.profiler import profile, record_function, ProfilerActivity
 
 from model import GPTConfig, GPT
+# --- Debug Imports ---
+from model import debug_stats, print_and_reset_debug_stats, increment_debug_step
+# -------------------
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -144,6 +147,11 @@ if os.path.exists(meta_path):
         meta = pickle.load(f)
     meta_vocab_size = meta['vocab_size']
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
+
+# --- Debug Activation ---
+debug_stats['active'] = True # Set to True to enable debugging stats
+debug_stats['log_interval'] = 100 # Print stats every 100 steps (adjust as needed)
+# ----------------------
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
@@ -359,6 +367,12 @@ try:
                 mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
                 running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
             print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+
+        # --- Debug Step Increment ---
+        if master_process: # Only increment/print on master process
+            increment_debug_step()
+        # --------------------------
+
         iter_num += 1
         local_iter_num += 1
 

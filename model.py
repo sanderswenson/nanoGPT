@@ -15,6 +15,102 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+# --- Debug Utilities ---
+import math
+
+# Global state for debugging stats
+debug_stats = {
+    'active': False, # Flag to enable/disable collection
+    'step_count_since_reset': 0,
+    'log_interval': 100, # How often to print/reset
+    'metrics': {
+        'k_compressed': {'max_val': -float('inf'), 'has_nan_inf': False},
+        'local_attn_out': {'max_val': -float('inf'), 'has_nan_inf': False},
+        'compressed_attn_out': {'max_val': -float('inf'), 'has_nan_inf': False},
+        'gates': {'max_val': -float('inf'), 'has_nan_inf': False, 'last_gates': None}, # Keep gates for potential future use
+        'combined': {'max_val': -float('inf'), 'has_nan_inf': False},
+    }
+}
+
+def _update_metric_stats(tensor, metric_name):
+    """Helper to update stats for a single tensor."""
+    global debug_stats
+    # Only run if debugging is active and tensor is valid
+    if not debug_stats['active'] or not isinstance(tensor, torch.Tensor) or metric_name not in debug_stats['metrics']:
+        return
+
+    stats = debug_stats['metrics'][metric_name]
+
+    # Check for NaN/Inf only once per interval if not already flagged
+    if not stats['has_nan_inf']:
+        if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+            stats['has_nan_inf'] = True
+            print(f"WARNING: NaN or Inf detected in '{metric_name}' at step {debug_stats['step_count_since_reset']}!")
+
+    # Track max value if tensor is not empty
+    if tensor.numel() > 0:
+        try:
+            # Use try-except for max() on potentially NaN/Inf tensors
+            # Ensure tensor is on CPU before calling .item() if necessary, but max() works on GPU
+            current_max = tensor.detach().max().item()
+            # Update max_val if current_max is a valid number
+            if not math.isnan(current_max) and not math.isinf(current_max):
+                 stats['max_val'] = max(stats['max_val'], current_max)
+        except RuntimeError: # Catch errors if max() fails (e.g., on all-NaN tensor)
+             # If max fails, ensure NaN/Inf flag is set
+             if not stats['has_nan_inf']:
+                 stats['has_nan_inf'] = True
+                 print(f"WARNING: Runtime error calculating max for '{metric_name}' at step {debug_stats['step_count_since_reset']} (likely NaN/Inf)!")
+
+    # Special handling for gates (if gating is re-enabled later)
+    if metric_name == 'gates':
+         if tensor.numel() > 0: # Ensure tensor is not empty
+            stats['last_gates'] = tensor[0, 0, :].detach().cpu().numpy() # Store latest sample from first batch item
+
+# Hook functions definition (using _update_metric_stats)
+def compression_mlp_hook(module, input, output):
+     _update_metric_stats(output, 'k_compressed')
+
+def gating_hook(module, input, output):
+     # This hook is registered but won't run if gating is commented out
+     _update_metric_stats(output, 'gates')
+
+def print_and_reset_debug_stats():
+    """Prints collected stats summary and resets them."""
+    global debug_stats
+    if not debug_stats['active']:
+        return
+
+    print("\n--- Debug Stats Summary ---")
+    print(f"Stats collected over {debug_stats['step_count_since_reset']} steps:")
+    for name, stats in debug_stats['metrics'].items():
+        # Format max value, handling the initial -inf
+        max_val_str = f"{stats['max_val']:.4f}" if stats['max_val'] > -float('inf') else "N/A"
+        # Format NaN/Inf flag
+        nan_inf_str = "YES" if stats['has_nan_inf'] else "NO"
+        # Format optional gates info
+        gates_str = f" | Last Sample: {stats['last_gates']}" if name == 'gates' and stats['last_gates'] is not None else ""
+        print(f"  {name:<20}: Max Val Seen: {max_val_str:<12} | NaN/Inf Seen: {nan_inf_str:<3}{gates_str}")
+    print("--- End Debug Stats Summary ---\n")
+
+    # Reset stats for the next interval
+    debug_stats['step_count_since_reset'] = 0
+    for name in debug_stats['metrics']:
+        debug_stats['metrics'][name]['max_val'] = -float('inf')
+        debug_stats['metrics'][name]['has_nan_inf'] = False
+        if name == 'gates':
+             debug_stats['metrics'][name]['last_gates'] = None # Reset last gates sample
+
+def increment_debug_step():
+    """Increments the step counter and triggers print/reset at interval."""
+    global debug_stats
+    if debug_stats['active']:
+        debug_stats['step_count_since_reset'] += 1
+        # Check if the logging interval has been reached
+        if debug_stats['step_count_since_reset'] >= debug_stats['log_interval']:
+            print_and_reset_debug_stats() # Print and reset if interval is reached
+# --- End Debug Utilities ---
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -155,60 +251,64 @@ class MultiAttentionWithGating(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        
-        # Store config
+
         self.config = config
-        
-        # QKV projections
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        
-        # Parameters
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
         self.block_length = config.block_length
         self.stride_length = config.stride_length
-        
-        # Initialize attention patterns
+
         self.attention_patterns = nn.ModuleList([
-            # CausalAttentionPattern(config),
             LocalAttentionPattern(config)
         ])
         self.compression_mlp = CompressionMLP(config)
-        # Initialize gating mechanism
-        self.gating = AttentionGating(config, len(self.attention_patterns))
-        
-        # Dropouts
+        # Gating expects N patterns + 1 compressed output
+        self.gating = AttentionGating(config, len(self.attention_patterns) + 1)
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
-        
-        # Flash attention support
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-    
+
+        # Register hooks for debugging
+        if debug_stats['active']:
+            self.compression_mlp.register_forward_hook(compression_mlp_hook)
+            self.gating.register_forward_hook(gating_hook)
+
     def apply_attention(self, q, k, v, pattern, T, compressed_T=None, is_causal=False):
         """Apply attention with a specific pattern"""
 
-        # DEBUG: Check if flash is active - REMOVED
-        # print(f"Inside apply_attention: self.flash = {self.flash}")
-
-        # Determine if we should force the non-flash path for this specific pattern - REMOVED
-        # force_non_flash = isinstance(pattern, LocalAttentionPattern)
-
         # Original logic, relying on pattern.is_causal() and self.flash
         if self.flash:
-            # print("Using Flash Attention path") # DEBUG REMOVED
             attn_mask = None # Default for causal or no mask
+            # Get pattern mask ONLY if pattern is not None
             pattern_mask = pattern.get_mask(T) if pattern is not None else None
 
             if is_causal:
                  # Let flash handle causality if is_causal=True
                  pass # attn_mask remains None
             elif pattern_mask is not None:
-                 # If pattern exists and is_causal=False (e.g., a future non-causal pattern)
+                 # If pattern exists and is_causal=False
                  # Convert 0/1 mask to 0.0/-inf float mask.
                  attn_mask = pattern_mask.float().masked_fill(pattern_mask == 0, float('-inf'))
             # Else: No pattern and not is_causal, attn_mask remains None (full attention)
+
+            # Handle potentially different sequence lengths for K/V in compressed attention
+            if compressed_T is not None and k.shape[2] != q.shape[2]:
+                # Flash attention needs explicit mask for cross-attention with different lengths
+                # We want causal attention from q (len T) to k/v (len compressed_T)
+                # If is_causal is True, Flash Attention *might* handle this if T == compressed_T, but not if different.
+                # Generate the explicit causal mask for T x compressed_T
+                causal_mask_shape = (T, compressed_T)
+                causal_mask = torch.ones(causal_mask_shape, device=q.device, dtype=torch.bool).tril(diagonal=0)
+                # Convert boolean mask to float mask needed by flash attn
+                # Where mask is False (upper triangle), set to -inf
+                attn_mask = torch.zeros(causal_mask_shape, device=q.device, dtype=q.dtype)
+                attn_mask = attn_mask.masked_fill(~causal_mask, float("-inf"))
+                attn_mask = attn_mask.unsqueeze(0).unsqueeze(0) # Add batch and head dims
+                # Since we provided an explicit mask, set is_causal=False
+                is_causal = False
 
             return torch.nn.functional.scaled_dot_product_attention(
                 q, k, v,
@@ -218,138 +318,142 @@ class MultiAttentionWithGating(nn.Module):
             )
         else:
             # Use non-flash path if flash not available
-            # print("Using Non-Flash Attention path") # DEBUG REMOVED
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             if pattern is not None:
                 mask = pattern.get_mask(T)
                 # Non-flash path correctly handles 0/1 mask with masked_fill
                 att = att.masked_fill(mask == 0, float('-inf'))
             elif is_causal:
-                # Manual causal mask for non-flash (used if pattern is None but is_causal=True)
-                actual_T = compressed_T or T
-                causal_mask = torch.tril(torch.ones(T, actual_T, device=q.device)).view(1, 1, T, actual_T)
+                # Manual causal mask for non-flash (handles T x T or T x compressed_T)
+                actual_T_k = compressed_T or T # Length of key/value sequence
+                causal_mask = torch.tril(torch.ones(T, actual_T_k, device=q.device)).view(1, 1, T, actual_T_k)
                 att = att.masked_fill(causal_mask == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             return att @ v
-    
+
     def forward(self, x):
         B, T, C = x.size()
-        
-        # Compute QKV
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        k_orig = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v_orig = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        # Compress k and v using sliding window approach
-        k_compressed = self.compression_mlp(k)  # [B, nh, num_blocks, hs]
-        v_compressed = self.compression_mlp(v)  # [B, nh, num_blocks, hs]
-        
-        # Calculate number of blocks after compression
-        num_blocks = max(1, (T - self.block_length) // self.stride_length + 1)
-        
-        # Apply each attention pattern
+        # --- Compression Path Enabled ---
+        k_compressed = self.compression_mlp(k_orig)
+        v_compressed = self.compression_mlp(v_orig)
+        num_blocks = k_compressed.shape[2]
+        # ---------------------------------
+
         attention_outputs = []
-        for pattern in self.attention_patterns:
-            # DEBUG: Print mask for LocalAttentionPattern - REMOVED
-            # if isinstance(pattern, LocalAttentionPattern):
-            #     mask = pattern.get_mask(T)
-            #     print(f"LocalAttentionPattern mask shape: {mask.shape}")
-            #     print(f"LocalAttentionPattern mask sample (first 5x5):\n{mask[0,0,:5,:5]}")
-
-            # Pass pattern.is_causal() to the apply_attention function
-            out = self.apply_attention(q, k, v, pattern, T, is_causal=pattern.is_causal())
+        # Local Attention Path
+        for i, pattern in enumerate(self.attention_patterns):
+            out = self.apply_attention(q, k_orig, v_orig, pattern, T, is_causal=pattern.is_causal())
             out = out.transpose(1, 2).contiguous().view(B, T, C)
-            attention_outputs.append(out)  # [B, T, C]
+            attention_outputs.append(out)
+            if isinstance(pattern, LocalAttentionPattern):
+                 _update_metric_stats(out, 'local_attn_out')
 
-            # DEBUG: Print output of LocalAttentionPattern - REMOVED
-            # if isinstance(pattern, LocalAttentionPattern):
-            #     print(f"LocalAttentionPattern output shape: {out.shape}")
-            #     print(f"LocalAttentionPattern output sample (first 5 tokens, first 5 features):\n{out[0,:5,:5]}")
-        
-        # Apply compressed attention
-        # compressed_out = self.apply_attention(q, k_compressed, v_compressed, 
-        #                                    None, 
-        #                                    T, compressed_T=num_blocks, is_causal=True)
-        # compressed_out = compressed_out.transpose(1, 2).contiguous().view(B, T, C)
-        # attention_outputs.append(compressed_out)
-        
-        # DEBUG: Temporarily disable gating
-        # gates = self.gating(attention_outputs)  # Now all outputs are [B, T, C]
-        # combined = sum(g * out for g, out in zip(gates.chunk(len(attention_outputs), dim=-1), 
-        #                                        attention_outputs))
-        combined = attention_outputs[0] # Still using only the first pattern output (LocalAttentionPattern)
-        
+        # --- Compressed Attention Enabled ---
+        compressed_out = self.apply_attention(q, k_compressed, v_compressed,
+                                           pattern=None, T=T, compressed_T=num_blocks, is_causal=True)
+        compressed_out = compressed_out.transpose(1, 2).contiguous().view(B, T, C)
+        _update_metric_stats(compressed_out, 'compressed_attn_out')
+        attention_outputs.append(compressed_out)
+        # ------------------------------------
+
+        # --- Combination Strategy (Gating Re-enabled) ---
+        # Averaging removed:
+        # combined = torch.stack(attention_outputs, dim=0).mean(dim=0)
+
+        # Gating mechanism:
+        gates = self.gating(attention_outputs) # Hook will capture stats if active
+        combined = sum(g * out for g, out in zip(gates.chunk(len(attention_outputs), dim=-1),
+                                               attention_outputs))
+        # ----------------------------------------------
+
+        _update_metric_stats(combined, 'combined')
+
         # Final projection
         return self.resid_dropout(self.c_proj(combined))
-    
+
 class CompressionMLP(nn.Module):
-    """MLP for compressing key and value sequences in the temporal dimension using a sliding window approach"""
+    """MLP for compressing key and value sequences - MLP after Attention Pooling."""
     def __init__(self, config):
         super().__init__()
         self.block_length = config.block_length
         self.stride_length = config.stride_length
         self.n_head = config.n_head
         self.head_size = config.n_embd // config.n_head
-        
-        # Simple position embeddings for intra-block positions
+
+        # Positional embeddings for intra-block positions
         self.pos_emb = nn.Embedding(config.block_size, self.head_size)
-        
-        # Compression MLP to process each block
-        self.c_fc = nn.Linear(self.head_size * self.block_length, 4 * self.head_size, bias=config.bias)
+
+        # Learnable query for Attention Pooling
+        self.pool_query = nn.Parameter(torch.randn(1, self.n_head, 1, self.head_size))
+        # Optional: Initialize pool_query better? e.g., Xavier initialization
+        torch.nn.init.xavier_uniform_(self.pool_query)
+
+        # Dropout for attention pooling
+        self.pool_attn_dropout = nn.Dropout(config.dropout)
+
+        # MLP applied *after* pooling (hs -> 4*hs -> hs)
+        self.c_fc = nn.Linear(self.head_size, 4 * self.head_size, bias=config.bias)
         self.gelu = nn.GELU()
         self.c_proj = nn.Linear(4 * self.head_size, self.head_size, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
         self.ln = LayerNorm(self.head_size, bias=config.bias)
 
+
     def forward(self, x):
         # x shape: (B, nh, T, hs)
         B, nh, T, hs = x.size()
-        
-        # Determine the number of blocks after sliding window
         num_blocks = max(1, (T - self.block_length) // self.stride_length + 1)
-        
-        # Prepare output tensor for compressed representations
-        compressed = []
-        
-        # Apply sliding window and compress each block
+        compressed_blocks = []
+
+        pos = torch.arange(0, self.block_length, device=x.device)
+        pos_embeddings = self.pos_emb(pos).view(1, 1, self.block_length, hs)
+        pool_q = self.pool_query.expand(B, -1, -1, -1)
+
         for i in range(num_blocks):
-            # Get the current block
             start_idx = i * self.stride_length
             end_idx = min(start_idx + self.block_length, T)
-            
-            # Handle the case where the final block is smaller than block_length
             actual_block_length = end_idx - start_idx
-            
+
             if actual_block_length < self.block_length:
-                # Pad the block to block_length
                 padding_size = self.block_length - actual_block_length
                 block = F.pad(x[:, :, start_idx:end_idx, :], (0, 0, 0, padding_size))
             else:
                 block = x[:, :, start_idx:end_idx, :]
-            
-            # Add position embeddings to tokens within the block
-            pos = torch.arange(0, self.block_length, device=x.device)
-            pos_emb = self.pos_emb(pos).view(1, 1, self.block_length, hs)
-            block = block + pos_emb  # Broadcasting handles dimensions
-            
-            # Reshape for MLP processing
-            block = block.reshape(B, nh, self.block_length * hs)
-            
-            # Apply compression MLP
-            block_compressed = self.c_fc(block)
-            block_compressed = self.gelu(block_compressed)
-            block_compressed = self.c_proj(block_compressed)
-            block_compressed = self.dropout(block_compressed)
-            block_compressed = self.ln(block_compressed)
-            
-            compressed.append(block_compressed)
-        
-        # Stack all compressed representations
-        compressed = torch.stack(compressed, dim=2)  # [B, nh, num_blocks, hs]
-        
-        return compressed  # (B, nh, num_blocks, hs)
+
+            # Add positional embeddings
+            block_with_pos = block + pos_embeddings[:, :, :self.block_length, :]
+
+            # 1. Attention Pooling (Applied to block + pos_emb)
+            # K=V: block_with_pos [B, nh, block_length, hs]
+            pooled_summary_attn = F.scaled_dot_product_attention(
+                pool_q,
+                block_with_pos, # Key
+                block_with_pos, # Value
+                attn_mask=None,
+                dropout_p=self.pool_attn_dropout.p if self.training else 0,
+                is_causal=False
+            )
+            # Squeeze to get initial summary: [B, nh, hs]
+            pooled_summary = pooled_summary_attn.squeeze(2)
+
+            # 2. Apply MLP *after* pooling to refine the summary
+            # Input shape to MLP: (B, nh, hs)
+            refined_summary = self.c_fc(pooled_summary)      # -> (B, nh, 4*hs)
+            refined_summary = self.gelu(refined_summary)
+            refined_summary = self.c_proj(refined_summary)   # -> (B, nh, hs)
+            refined_summary = self.dropout(refined_summary)
+            refined_summary = self.ln(refined_summary)      # -> (B, nh, hs)
+
+            compressed_blocks.append(refined_summary)
+
+        compressed_output = torch.stack(compressed_blocks, dim=2) # -> (B, nh, num_blocks, hs)
+        return compressed_output
 
 class MLP(nn.Module):
 
