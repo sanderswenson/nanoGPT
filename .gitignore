@@ -14,3 +14,4 @@ nanoGPT-env/
 log/pytorch_profiler/
 *.pt.trace.json
 *.pdf
+/DeepSeek_NSA

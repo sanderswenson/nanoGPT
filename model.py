@@ -188,10 +188,17 @@ class AttentionGating(nn.Module):
             nn.Softmax(dim=-1)
         )
     
-    def forward(self, attention_outputs):
-        B = attention_outputs[0].size(0)
-        features = torch.cat([out.mean(dim=1) for out in attention_outputs], dim=-1)
-        return self.gate(features).unsqueeze(1)
+    def forward(self, attention_path_outputs):
+        # Input: List of attention outputs (e.g., [local_norm, compressed_raw]), each [B, T, C]
+        B = attention_path_outputs[0].size(0)
+        T = attention_path_outputs[0].size(1)
+
+        # Use last token features from the provided inputs
+        last_token_features = [out[:, -1, :] for out in attention_path_outputs]
+        features = torch.cat(last_token_features, dim=-1)
+
+        gate_weights = self.gate(features)
+        return gate_weights.unsqueeze(1) # Shape: [B, 1, num_patterns]
 
 class CausalSelfAttention(nn.Module):
 
@@ -265,15 +272,18 @@ class MultiAttentionWithGating(nn.Module):
             LocalAttentionPattern(config)
         ])
         self.compression_mlp = CompressionMLP(config)
-        # Gating expects N patterns + 1 compressed output
         self.gating = AttentionGating(config, len(self.attention_patterns) + 1)
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
 
-        # Register hooks for debugging
+        # Keep LayerNorm for local output
+        self.ln_local = LayerNorm(config.n_embd, bias=config.bias)
+        # REMOVE ln_compressed as CompressionMLP handles its own normalization now
+        # self.ln_compressed = LayerNorm(config.n_embd, bias=config.bias)
+
+        # Re-enable gating hook
         if debug_stats['active']:
-            self.compression_mlp.register_forward_hook(compression_mlp_hook)
             self.gating.register_forward_hook(gating_hook)
 
     def apply_attention(self, q, k, v, pattern, T, compressed_T=None, is_causal=False):
@@ -339,121 +349,92 @@ class MultiAttentionWithGating(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v_orig = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        # --- Compression Path Enabled ---
+        # --- Compression Path (Conv1d + Internal LN + GELU) ---
+        # Output of this is assumed to be normalized internally now
         k_compressed = self.compression_mlp(k_orig)
         v_compressed = self.compression_mlp(v_orig)
         num_blocks = k_compressed.shape[2]
-        # ---------------------------------
+        # -----------------------------------------------------
 
-        attention_outputs = []
-        # Local Attention Path
-        for i, pattern in enumerate(self.attention_patterns):
-            out = self.apply_attention(q, k_orig, v_orig, pattern, T, is_causal=pattern.is_causal())
-            out = out.transpose(1, 2).contiguous().view(B, T, C)
-            attention_outputs.append(out)
-            if isinstance(pattern, LocalAttentionPattern):
-                 _update_metric_stats(out, 'local_attn_out')
+        # --- Local Attention Path ---
+        local_pattern = self.attention_patterns[0]
+        local_out = self.apply_attention(q, k_orig, v_orig, local_pattern, T, is_causal=local_pattern.is_causal())
+        local_out = local_out.transpose(1, 2).contiguous().view(B, T, C)
+        # Normalize local output
+        local_out_norm = self.ln_local(local_out)
+        _update_metric_stats(local_out_norm, 'local_attn_out') # Log normalized
+        # --------------------------
 
-        # --- Compressed Attention Enabled ---
+        # --- Compressed Attention Path ---
         compressed_out = self.apply_attention(q, k_compressed, v_compressed,
                                            pattern=None, T=T, compressed_T=num_blocks, is_causal=True)
         compressed_out = compressed_out.transpose(1, 2).contiguous().view(B, T, C)
-        _update_metric_stats(compressed_out, 'compressed_attn_out')
-        attention_outputs.append(compressed_out)
+        # DO NOT normalize compressed_out again here
+        _update_metric_stats(compressed_out, 'compressed_attn_out') # Log raw compressed_out
+        # -------------------------------
+
+        # Prepare inputs for gating (using normalized local, raw compressed)
+        gating_inputs = [local_out_norm, compressed_out]
+
+        # --- Combination Strategy (Gating) ---
+        gates = self.gating(gating_inputs) # Gating decision based on norm local, raw compressed
+        # Combine normalized local and raw compressed using gates
+        combined = sum(g * out for g, out in zip(gates.chunk(len(gating_inputs), dim=-1),
+                                               gating_inputs))
         # ------------------------------------
-
-        # --- Combination Strategy (Gating Re-enabled) ---
-        # Averaging removed:
-        # combined = torch.stack(attention_outputs, dim=0).mean(dim=0)
-
-        # Gating mechanism:
-        gates = self.gating(attention_outputs) # Hook will capture stats if active
-        combined = sum(g * out for g, out in zip(gates.chunk(len(attention_outputs), dim=-1),
-                                               attention_outputs))
-        # ----------------------------------------------
 
         _update_metric_stats(combined, 'combined')
 
         # Final projection
         return self.resid_dropout(self.c_proj(combined))
 
+
 class CompressionMLP(nn.Module):
-    """MLP for compressing key and value sequences - MLP after Attention Pooling."""
+    """MLP for compressing key and value sequences - Conv1d + LN + GELU."""
     def __init__(self, config):
         super().__init__()
         self.block_length = config.block_length
         self.stride_length = config.stride_length
         self.n_head = config.n_head
         self.head_size = config.n_embd // config.n_head
+        self.bias = config.bias
 
-        # Positional embeddings for intra-block positions
-        self.pos_emb = nn.Embedding(config.block_size, self.head_size)
-
-        # Learnable query for Attention Pooling
-        self.pool_query = nn.Parameter(torch.randn(1, self.n_head, 1, self.head_size))
-        # Optional: Initialize pool_query better? e.g., Xavier initialization
-        torch.nn.init.xavier_uniform_(self.pool_query)
-
-        # Dropout for attention pooling
-        self.pool_attn_dropout = nn.Dropout(config.dropout)
-
-        # MLP applied *after* pooling (hs -> 4*hs -> hs)
-        self.c_fc = nn.Linear(self.head_size, 4 * self.head_size, bias=config.bias)
+        # 1D Convolution for aggregation
+        self.conv_agg = nn.Conv1d(
+            in_channels=self.head_size,
+            out_channels=self.head_size,
+            kernel_size=self.block_length,
+            stride=self.stride_length,
+            bias=self.bias
+        )
+        # Restore LN and GELU applied after convolution
+        self.ln = LayerNorm(self.head_size, bias=self.bias)
         self.gelu = nn.GELU()
-        self.c_proj = nn.Linear(4 * self.head_size, self.head_size, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
-        self.ln = LayerNorm(self.head_size, bias=config.bias)
-
 
     def forward(self, x):
-        # x shape: (B, nh, T, hs)
+        # Input x shape: (B, nh, T, hs)
         B, nh, T, hs = x.size()
-        num_blocks = max(1, (T - self.block_length) // self.stride_length + 1)
-        compressed_blocks = []
+        x_reshaped = x.permute(0, 1, 3, 2).reshape(B * nh, hs, T)
 
-        pos = torch.arange(0, self.block_length, device=x.device)
-        pos_embeddings = self.pos_emb(pos).view(1, 1, self.block_length, hs)
-        pool_q = self.pool_query.expand(B, -1, -1, -1)
+        # Padding for short sequences
+        kernel_size = self.block_length
+        if T < kernel_size:
+            padding_needed = kernel_size - T
+            x_reshaped = F.pad(x_reshaped, (0, padding_needed))
 
-        for i in range(num_blocks):
-            start_idx = i * self.stride_length
-            end_idx = min(start_idx + self.block_length, T)
-            actual_block_length = end_idx - start_idx
+        # Apply convolution
+        conv_out = self.conv_agg(x_reshaped)
 
-            if actual_block_length < self.block_length:
-                padding_size = self.block_length - actual_block_length
-                block = F.pad(x[:, :, start_idx:end_idx, :], (0, 0, 0, padding_size))
-            else:
-                block = x[:, :, start_idx:end_idx, :]
+        # Restore LN and GELU application
+        ln_out = self.ln(conv_out.permute(0, 2, 1)) # Permute, Normalize
+        processed_out = self.gelu(ln_out)          # Activate
 
-            # Add positional embeddings
-            block_with_pos = block + pos_embeddings[:, :, :self.block_length, :]
+        # Reshape back
+        num_blocks = processed_out.shape[1]
+        output_reshaped = processed_out.view(B, nh, num_blocks, hs)
 
-            # 1. Attention Pooling (Applied to block + pos_emb)
-            # K=V: block_with_pos [B, nh, block_length, hs]
-            pooled_summary_attn = F.scaled_dot_product_attention(
-                pool_q,
-                block_with_pos, # Key
-                block_with_pos, # Value
-                attn_mask=None,
-                dropout_p=self.pool_attn_dropout.p if self.training else 0,
-                is_causal=False
-            )
-            # Squeeze to get initial summary: [B, nh, hs]
-            pooled_summary = pooled_summary_attn.squeeze(2)
-
-            # 2. Apply MLP *after* pooling to refine the summary
-            # Input shape to MLP: (B, nh, hs)
-            refined_summary = self.c_fc(pooled_summary)      # -> (B, nh, 4*hs)
-            refined_summary = self.gelu(refined_summary)
-            refined_summary = self.c_proj(refined_summary)   # -> (B, nh, hs)
-            refined_summary = self.dropout(refined_summary)
-            refined_summary = self.ln(refined_summary)      # -> (B, nh, hs)
-
-            compressed_blocks.append(refined_summary)
-
-        compressed_output = torch.stack(compressed_blocks, dim=2) # -> (B, nh, num_blocks, hs)
-        return compressed_output
+        _update_metric_stats(output_reshaped, 'k_compressed')
+        return output_reshaped
 
 class MLP(nn.Module):
 

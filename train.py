@@ -31,7 +31,7 @@ from torch.profiler import profile, record_function, ProfilerActivity
 
 from model import GPTConfig, GPT
 # --- Debug Imports ---
-from model import debug_stats, print_and_reset_debug_stats, increment_debug_step
+# from model import debug_stats, print_and_reset_debug_stats, increment_debug_step
 # -------------------
 
 # -----------------------------------------------------------------------------
@@ -149,8 +149,8 @@ if os.path.exists(meta_path):
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # --- Debug Activation ---
-debug_stats['active'] = True # Set to True to enable debugging stats
-debug_stats['log_interval'] = 100 # Print stats every 100 steps (adjust as needed)
+# debug_stats['active'] = True # Set to True to enable debugging stats
+# debug_stats['log_interval'] = 100 # Print stats every 100 steps (adjust as needed)
 # ----------------------
 
 # model init
@@ -369,8 +369,8 @@ try:
             print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
 
         # --- Debug Step Increment ---
-        if master_process: # Only increment/print on master process
-            increment_debug_step()
+        # if master_process: # Only increment/print on master process
+        #     increment_debug_step()
         # --------------------------
 
         iter_num += 1
