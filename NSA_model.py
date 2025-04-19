@@ -184,6 +184,7 @@ class NativeSparseAttention(nn.Module):
         # Compression MLP (using the new block-based implementation)
         self.comp_mlp = CompressionMLP(config)  # for keys
         self.comp_mlp_v = CompressionMLP(config)  # for values
+        # self.comp_mlp_q = CompressionMLP(config)  # for queries
 
         # Gating mechanism (based on input features x, outputting n_embd)
         self.gate_mlp = nn.Sequential(
@@ -281,24 +282,27 @@ class NativeSparseAttention(nn.Module):
         if num_blocks > 0:
             # Manual implementation with causal masking
             scale = 1.0 / math.sqrt(k_comp.size(-1))
-            att_comp = (q @ k_comp.transpose(-2, -1)) * scale # Shape (B, nh, T, T_comp)
+            att_comp = (q @ k_comp.transpose(-2, -1)) * scale  # Shape (B, nh, T, T_comp)
 
-            # --- Corrected Causal Mask Calculation ---
-            # query_indices: tensor of shape (T,) representing query time steps [0, 1, ..., T-1]
-            query_indices = torch.arange(T, device=q.device)
-            # block_start_indices: tensor of shape (T_comp,) representing the approximate start time index of each compressed block
-            block_start_indices = torch.arange(T_comp, device=q.device) * self.stride_length
+            # --- Build Causal Mask for Compressed Attention ---
+            # For causal attention, each query token at time step t should only attend to compressed blocks whose start index is <= t.
+            # We compute two tensors:
+            #   query_indices: a (T, 1) tensor containing [0, 1, ..., T-1], where T is the sequence length.
+            #   block_start_indices: a (1, T_comp) tensor with values [0, stride_length, 2*stride_length, ...],
+            #       representing the approximate starting index of each compressed block.
+            # The allowed condition is: block_start_indices[j] <= query_indices[t]. We then invert this allowed mask
+            # to obtain positions that should be masked (set to -inf) in the attention scores.
+            query_indices = torch.arange(q.size(2), device=q.device).unsqueeze(1)  # Shape: (T, 1)
+            block_start_indices = torch.arange(att_comp.size(-1), device=q.device).unsqueeze(0) * self.stride_length  # Shape: (1, T_comp)
+            allowed_mask = block_start_indices <= query_indices  # Shape: (T, T_comp); True where attention is allowed
+            causal_mask = ~allowed_mask  # Invert: True where attention should be masked out
+            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # Expand to match att_comp shape (B, nh, T, T_comp)
+            # --- End of Causal Mask Construction ---
+            # print(f"causal_mask: {causal_mask.shape}")
+            # print(f"boolean: {causal_mask[0,0,:10,:10]}")
 
-            # mask[t, j] is True if query t SHOULD attend to block j.
-            # This occurs if the block starts at or after the query time step: block_start_indices[j] >= query_indices[t]
-            causal_mask_bool = block_start_indices.unsqueeze(0) >= query_indices.unsqueeze(1) # Shape (T, T_comp)
-
-            # Expand mask dimensions for broadcasting: (1, 1, T, T_comp)
-            causal_mask_expanded = causal_mask_bool.unsqueeze(0).unsqueeze(0)
-            # --- End Corrected Causal Mask Calculation ---
-
-            # Apply the correct mask
-            att_comp = att_comp.masked_fill(causal_mask_expanded, float('-inf'))
+            # Apply the causal mask to the compressed attention scores
+            att_comp = att_comp.masked_fill(causal_mask, float('-inf'))
 
             # Continue with softmax and value aggregation
             att_comp = F.softmax(att_comp, dim=-1)
@@ -322,6 +326,8 @@ class NativeSparseAttention(nn.Module):
         y_local_flat = y_local.transpose(1, 2).contiguous().view(B, T, -1)
         # TODO: Confirm that y_comp is not producing pathological outputs.
         y_comp_flat = y_comp.transpose(1, 2).contiguous().view(B, T, -1)
+        # print(f"y_comp_flat shape: {y_comp_flat.shape}")
+        # print(f"y_comp_flat full tensor:\n{y_comp_flat.detach().cpu().numpy()}")
 
         # Calculate gate based on input features x
         # TODO: Seperate the gates for local and compressed attention.
@@ -368,8 +374,8 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     local_window_size: int = 128  # Size of the local attention window
-    block_length: int = 32  # Length of each block for sliding window compression
-    stride_length: int = 28  # Stride between consecutive blocks for sliding window compression
+    block_length: int = 8  # Length of each block for sliding window compression
+    stride_length: int = 4  # Stride between consecutive blocks for sliding window compression
 
 class GPT(nn.Module):   
 
