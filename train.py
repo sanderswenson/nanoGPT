@@ -28,6 +28,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 import torch.profiler
 from torch.profiler import profile, record_function, ProfilerActivity
+import tiktoken # Added for sampling if meta.pkl is not found
 
 from model import GPTConfig, GPT
 # --- Debug Imports ---
@@ -74,9 +75,14 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+device = 'cpu' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
+compile = False # use PyTorch 2.0 to compile the model to be faster
+# Sampling parameters (can be adjusted or moved to config)
+sample_max_new_tokens = 100
+sample_temperature = 0.8
+sample_top_k = 200
+sample_start = "First Citizen:\nWe are accounted poor citizens, the patricians good.\nWhat authority surfeits on would relieve us: if they\nwould yield us but the superfluity, while it were\nwholesome, we might guess they relieved us humanely;\nbut they think we are too dear: the leanness that\nafflicts us, the object of our misery, is as an\ninventory to particularise their abundance;\nour sufferance is a gain to them Let us revenge this with\nour pikes, ere we become rakes: for the gods know I\n speak this in hunger for bread, not \n" # Start prompt for sampling    
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -284,6 +290,25 @@ local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 
+# Load tokenizer for sampling
+encode = None
+decode = None
+if master_process: # Only load tokenizer on master process
+    meta_path = os.path.join(data_dir, 'meta.pkl')
+    load_meta = os.path.exists(meta_path)
+    if load_meta:
+        print(f"Loading meta from {meta_path} for sampling...")
+        with open(meta_path, 'rb') as f:
+            meta = pickle.load(f)
+        stoi, itos = meta['stoi'], meta['itos']
+        encode = lambda s: [stoi[c] for c in s]
+        decode = lambda l: ''.join([itos[i] for i in l])
+    else:
+        print("No meta.pkl found, assuming GPT-2 encodings for sampling...")
+        enc = tiktoken.get_encoding("gpt2")
+        encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
+        decode = lambda l: enc.decode(l)
+
 try:
     while True:
         # determine and set the learning rate for this iteration
@@ -297,6 +322,21 @@ try:
                 with record_function("evaluation"):
                     losses = estimate_loss()
                 print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+
+                # ---- GENERATION START ----
+                if iter_num > 0: # Avoid sampling at iteration 0
+                    print("--- Generating Sample ---")
+                    raw_model.eval() # Set model to eval mode for generation
+                    start_ids = encode(sample_start)
+                    x_sample = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+                    with torch.no_grad():
+                        with ctx: # Use the same autocast context
+                           y_sample = raw_model.generate(x_sample, sample_max_new_tokens, temperature=sample_temperature, top_k=sample_top_k)
+                    print(decode(y_sample[0].tolist()))
+                    print("-------------------------")
+                    raw_model.train() # Set model back to train mode
+                # ---- GENERATION END ----
+
                 if wandb_log:
                     wandb.log({
                         "iter": iter_num,

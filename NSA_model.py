@@ -113,12 +113,13 @@ class CompressionMLP(nn.Module):
         self.fc2 = nn.Linear(self.block_length * 4, 1, bias=config.bias) # Outputting a single vector per block
         
         # Residual projection for when shapes don't match
-        self.residual_proj = nn.Linear(self.hs, self.hs, bias=config.bias)
+        self.residual_proj = nn.Linear(config.block_length, 1, bias=config.bias)
         
         # Add dropout to help prevent overfitting
-        self.dropout = nn.Dropout(config.dropout)
+        self.dropout = nn.Dropout(0.05)#config.dropout)
         
         # Intra-block positional embeddings
+        # TODO: Consider when to use the positional embeddings.
         self.wpe_block = nn.Embedding(config.block_length, self.hs)
         
     def forward(self, x):
@@ -134,7 +135,7 @@ class CompressionMLP(nn.Module):
         num_blocks = x_unfolded.size(2)
         
         # Store original shape for residual connection
-        x_orig = x_unfolded
+        x_orig = x_unfolded # (B, nh, num_blocks, hs, L_b)
         
         # Apply positional embeddings to the unfolded blocks
         pos_block = torch.arange(self.block_length, device=x.device)
@@ -147,19 +148,11 @@ class CompressionMLP(nn.Module):
         x = self.fc1(x) # (B, nh, num_blocks, hs, hidden_dim)
         x = self.gelu(x)
         x = self.dropout(x) # Add dropout here
-        x = self.fc2(x) # (B, nh, num_blocks, hs, 1)
-        
-        # Squeeze the last dimension (L_b dimension is now 1)
-        x = x.squeeze(-1) # (B, nh, num_blocks, hs)
-        
-        # Add residual connection
-        # We need to project the original unfolded tensor to match the compressed shape
-        # Take the mean of each block as a simple projection
-        x_orig_proj = x_orig.mean(dim=-1) # (B, nh, num_blocks, hs)
-        
-        # Apply residual connection
+        x = self.fc2(x)
+        x = x.squeeze(-1)
+        x_orig_proj = self.residual_proj(x_orig).squeeze(-1)
         x = x + x_orig_proj
-        
+        x = x.clamp(-3, 3)  # Clip final output to [-3, 3]
         return x
 
 class NativeSparseAttention(nn.Module):
@@ -189,7 +182,8 @@ class NativeSparseAttention(nn.Module):
         assert self.stride_length > 0, "stride_length must be > 0"
 
         # Compression MLP (using the new block-based implementation)
-        self.comp_mlp = CompressionMLP(config)
+        self.comp_mlp = CompressionMLP(config)  # for keys
+        self.comp_mlp_v = CompressionMLP(config)  # for values
 
         # Gating mechanism (based on input features x, outputting n_embd)
         self.gate_mlp = nn.Sequential(
@@ -211,6 +205,7 @@ class NativeSparseAttention(nn.Module):
         combined_mask = causal_mask & local_mask
         self.register_buffer("local_causal_allow_mask", combined_mask.view(1, 1, config.block_size, config.block_size))
 
+        
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         hs = C // self.n_head # head size
@@ -226,14 +221,23 @@ class NativeSparseAttention(nn.Module):
         k_local = k_local.view(B, T, self.n_head, hs).transpose(1, 2) # (B, nh, T, hs)
         v_local = v_local.view(B, T, self.n_head, hs).transpose(1, 2) # (B, nh, T, hs)
         # Reshape K_comp_raw, V_comp_raw for compression steps
-        k_comp_raw = k_comp_raw.view(B, T, self.n_head, hs).transpose(1, 2) # (B, nh, T, hs)
-        v_comp_raw = v_comp_raw.view(B, T, self.n_head, hs).transpose(1, 2) # (B, nh, T, hs)
+        k_comp_raw = k_comp_raw.view(B, T, self.n_head, hs).transpose(1, 2) # (B, nh, T_comp, hs)
+        v_comp_raw = v_comp_raw.view(B, T, self.n_head, hs).transpose(1, 2) # (B, nh, T_comp, hs)
+
+
+
+####################### Somewhere outside of these two lines is the issue.
+
 
         # 2. Compression (using k_comp_raw, v_comp_raw)
         # Apply compression MLP directly (unfold is now handled inside the MLP)
         k_comp = self.comp_mlp(k_comp_raw) # (B, nh, num_blocks, hs)
-        v_comp = self.comp_mlp(v_comp_raw) # (B, nh, num_blocks, hs)
-        
+        v_comp = self.comp_mlp_v(v_comp_raw) # (B, nh, num_blocks, hs)
+
+
+#######################
+
+
         # Get the number of blocks for later use
         if T < self.block_length:
             num_blocks = 0
@@ -241,6 +245,7 @@ class NativeSparseAttention(nn.Module):
         else:
             num_blocks = k_comp.size(2)
             T_comp = num_blocks
+            
 
         # 4. Calculate Local Attention (using q, k_local, v_local)
         attn_mask_local = self.local_causal_allow_mask[:, :, :T, :T].expand(B, self.n_head, T, T)
@@ -257,15 +262,16 @@ class NativeSparseAttention(nn.Module):
                 print(f"Flash attention failed with explicit mask: {e}. Falling back to manual calculation.")
                 # Manual calculation fallback
                 att_local = (q @ k_local.transpose(-2, -1)) * (1.0 / math.sqrt(k_local.size(-1)))
-                attn_mask_local_bool = self.local_causal_allow_mask[:, :, :T, :T]
+                attn_mask_local_bool = ~self.local_causal_allow_mask[:, :, :T, :T] # Invert the mask
                 att_local = att_local.masked_fill(attn_mask_local_bool.expand(B, self.n_head, T, T), float('-inf'))
                 att_local = F.softmax(att_local, dim=-1)
                 att_local = self.attn_dropout(att_local)
                 y_local = att_local @ v_local # (B, nh, T, hs)
         else:
             # Manual implementation
+            print("Manual implementation of local attention")
             att_local = (q @ k_local.transpose(-2, -1)) * (1.0 / math.sqrt(k_local.size(-1)))
-            attn_mask_local_bool = self.local_causal_allow_mask[:, :, :T, :T]
+            attn_mask_local_bool = ~self.local_causal_allow_mask[:, :, :T, :T]
             att_local = att_local.masked_fill(attn_mask_local_bool.expand(B, self.n_head, T, T), float('-inf'))
             att_local = F.softmax(att_local, dim=-1)
             att_local = self.attn_dropout(att_local)
@@ -275,11 +281,29 @@ class NativeSparseAttention(nn.Module):
         if num_blocks > 0:
             # Manual implementation with causal masking
             scale = 1.0 / math.sqrt(k_comp.size(-1))
-            att_comp = (q @ k_comp.transpose(-2, -1)) * scale
-            causal_mask = torch.triu(torch.ones(T, T_comp, dtype=torch.bool, device=q.device), diagonal=1)
-            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
-            att_comp = att_comp.masked_fill(causal_mask, float('-inf'))
+            att_comp = (q @ k_comp.transpose(-2, -1)) * scale # Shape (B, nh, T, T_comp)
+
+            # --- Corrected Causal Mask Calculation ---
+            # query_indices: tensor of shape (T,) representing query time steps [0, 1, ..., T-1]
+            query_indices = torch.arange(T, device=q.device)
+            # block_start_indices: tensor of shape (T_comp,) representing the approximate start time index of each compressed block
+            block_start_indices = torch.arange(T_comp, device=q.device) * self.stride_length
+
+            # mask[t, j] is True if query t SHOULD attend to block j.
+            # This occurs if the block starts at or after the query time step: block_start_indices[j] >= query_indices[t]
+            causal_mask_bool = block_start_indices.unsqueeze(0) >= query_indices.unsqueeze(1) # Shape (T, T_comp)
+
+            # Expand mask dimensions for broadcasting: (1, 1, T, T_comp)
+            causal_mask_expanded = causal_mask_bool.unsqueeze(0).unsqueeze(0)
+            # --- End Corrected Causal Mask Calculation ---
+
+            # Apply the correct mask
+            att_comp = att_comp.masked_fill(causal_mask_expanded, float('-inf'))
+
+            # Continue with softmax and value aggregation
             att_comp = F.softmax(att_comp, dim=-1)
+            # Replace NaN values that can arise from rows being all -inf after masking (query attends to no blocks)
+            att_comp = torch.nan_to_num(att_comp)
             att_comp = self.attn_dropout(att_comp)
             y_comp = att_comp @ v_comp # (B, nh, T, hs)
         else:
@@ -296,11 +320,14 @@ class NativeSparseAttention(nn.Module):
         # 6. Combine Local and Compressed Attentions using per-dimension gating
         # Reshape attention outputs to (B, T, n_embd) for gating
         y_local_flat = y_local.transpose(1, 2).contiguous().view(B, T, -1)
+        # TODO: Confirm that y_comp is not producing pathological outputs.
         y_comp_flat = y_comp.transpose(1, 2).contiguous().view(B, T, -1)
 
         # Calculate gate based on input features x
+        # TODO: Seperate the gates for local and compressed attention.
+        # TODO: Try zeros_like(x) and ones_like(x) as gates.
         gate = self.gate_mlp(x) # (B, T, n_embd)
-
+        # gate = torch.ones_like(x) # (B, T, n_embd)
         # Apply the n_embd-dimensional gate
         y_combined_flat = gate * y_local_flat + (1 - gate) * y_comp_flat # (B, T, n_embd)
 
@@ -309,6 +336,10 @@ class NativeSparseAttention(nn.Module):
 
         # 7. Output Projection
         y = self.resid_dropout(self.c_proj(y))
+
+        # if self.training:
+        #     print("DEBUG: gate stats: mean={:.4f}, std={:.4f}, min={:.4f}, max={:.4f}".format(gate.mean().item(), gate.std().item(), gate.min().item(), gate.max().item()))
+
         return y
 
 class Block(nn.Module):
@@ -318,6 +349,7 @@ class Block(nn.Module):
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         # Use NativeSparseAttention instead of CausalSelfAttention
         self.attn = NativeSparseAttention(config)
+        # self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
@@ -336,10 +368,10 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     local_window_size: int = 128  # Size of the local attention window
-    block_length: int = 2  # Length of each block for sliding window compression
-    stride_length: int = 2  # Stride between consecutive blocks for sliding window compression
+    block_length: int = 32  # Length of each block for sliding window compression
+    stride_length: int = 28  # Stride between consecutive blocks for sliding window compression
 
-class GPT(nn.Module):
+class GPT(nn.Module):   
 
     def __init__(self, config):
         super().__init__()
@@ -396,6 +428,7 @@ class GPT(nn.Module):
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
@@ -553,3 +586,4 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
