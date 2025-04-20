@@ -29,6 +29,7 @@ from torch.distributed import init_process_group, destroy_process_group
 import torch.profiler
 from torch.profiler import profile, record_function, ProfilerActivity
 import tiktoken # Added for sampling if meta.pkl is not found
+import torch.nn as nn
 
 from model import GPTConfig, GPT
 # --- Debug Imports ---
@@ -75,9 +76,9 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
-device = 'cpu' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = False # use PyTorch 2.0 to compile the model to be faster
+compile = True # use PyTorch 2.0 to compile the model to be faster
 # Sampling parameters (can be adjusted or moved to config)
 sample_max_new_tokens = 100
 sample_temperature = 0.8
@@ -124,6 +125,9 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
+# probability of sampling a short sequence
+p_short_seq = 0.2
+
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
@@ -131,9 +135,19 @@ def get_batch(split):
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+
+    # Decide sequence length for this batch
+    if split == 'train' and np.random.rand() < p_short_seq:
+        # Sample a short sequence length
+        t = torch.randint(1, block_size, (1,)).item() # T_actual between 1 and block_size-1
+    else:
+        # Use full block size
+        t = block_size
+
+    ix = torch.randint(len(data) - t, (batch_size,))
+    x = torch.stack([torch.from_numpy((data[i:i+t]).astype(np.int64)) for i in ix]) # Shape (B, t)
+    y = torch.stack([torch.from_numpy((data[i+1:i+1+t]).astype(np.int64)) for i in ix]) # Shape (B, t)
+
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)

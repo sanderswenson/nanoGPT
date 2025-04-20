@@ -99,61 +99,80 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
-# Reverted simple CompressionMLP
+# Updated CompressionMLP
 class CompressionMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
+        # Store block and head parameters
         self.block_length = config.block_length
         self.stride_length = config.stride_length
         self.hs = config.n_embd // config.n_head
-        
-        # MLP layers operating on the block length dimension
-        self.fc1 = nn.Linear(self.block_length, self.block_length * 4, bias=config.bias)
-        self.gelu = nn.GELU()
-        self.fc2 = nn.Linear(self.block_length * 4, 1, bias=config.bias) # Outputting a single vector per block
-        
-        # Residual projection for when shapes don't match
-        self.residual_proj = nn.Linear(config.block_length, 1, bias=config.bias)
-        
-        # Add dropout to help prevent overfitting
-        self.dropout = nn.Dropout(0.05)#config.dropout)
-        
-        # Intra-block positional embeddings
-        # TODO: Consider when to use the positional embeddings.
+
+        # Intra-block positional embeddings to encode token order within each block.
+        # This lets the model know the relative positions of tokens inside each block.
         self.wpe_block = nn.Embedding(config.block_length, self.hs)
-        
+
+        # Define a two-layer MLP for gentle compression.
+        # The idea is to flatten each block (of shape [block_length, hs]) into a vector of size (hs * block_length).
+        # Then, we use an MLP to compress this high-dimensional vector into a compact representation of dimension hs,
+        # which is compatible with subsequent attention computations.
+        # Here, we choose a hidden dimension that is half of the flattened dimension as a moderate choice.
+        hidden_dim = (self.hs * config.block_length)
+        self.fc1 = nn.Linear(self.hs * config.block_length, hidden_dim, bias=config.bias)
+        self.gelu = nn.GELU()
+        self.ln = nn.LayerNorm(hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, self.hs, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout if hasattr(config, 'dropout') else 0.1)
+
+        # Residual connection: We use average pooling over the block tokens to get a baseline representation,
+        # which helps preserve the original information and gradients through the compression process.
+        self.residual_proj = nn.Linear(self.hs, self.hs, bias=config.bias)
+
     def forward(self, x):
-        # Input x shape: (B, nh, T, hs)
+        # x has shape (B, nh, T, hs), where B is batch size, nh is number of heads,
+        # T is the sequence length, and hs is the head dimension.
         B, nh, T, hs = x.shape
-        
-        # Handle case where sequence length is less than block length
         if T < self.block_length:
+            # If there are not enough tokens to form a block, return the input unchanged.
             return x
-            
-        # Unfold the sequence into blocks
-        x_unfolded = x.unfold(dimension=2, size=self.block_length, step=self.stride_length) # (B, nh, num_blocks, hs, L_b)
+
+        # Unfold the input along the time dimension to partition it into blocks.
+        # After unfolding, x_unfolded will have shape (B, nh, num_blocks, hs, block_length),
+        # where num_blocks = floor((T - block_length) / stride_length) + 1.
+        x_unfolded = x.unfold(dimension=2, size=self.block_length, step=self.stride_length)
         num_blocks = x_unfolded.size(2)
+
+        # Permute dimensions to bring the block_length dimension next to the head dimension.
+        # New shape becomes (B, nh, num_blocks, block_length, hs).
+        x_unfolded = x_unfolded.permute(0, 1, 2, 4, 3)
+
+        # Add intra-block positional embeddings to retain token order information within each block.
+        # Create a positional embedding vector for each position in the block, of shape (block_length, hs),
+        # and unsqueeze to broadcast over batch, head, and block indices.
+        pos = torch.arange(self.block_length, device=x.device)
+        pos_emb = self.wpe_block(pos).unsqueeze(0).unsqueeze(0).unsqueeze(2)  # shape: (1, 1, 1, block_length, hs)
+        x_unfolded = x_unfolded + pos_emb
+
+        # Flatten the block tokens: combine the block_length and hs dimensions into one vector.
+        # New shape: (B, nh, num_blocks, hs * block_length).
+        x_flat = x_unfolded.contiguous().view(B, nh, num_blocks, hs * self.block_length)
+
+        # Pass the flattened block through a two-layer MLP to obtain a compressed representation.
+        # First, project to a hidden space, apply GELU activation and dropout for regularization.
+        hidden = self.fc1(x_flat)       # shape: (B, nh, num_blocks, hidden_dim)
+        hidden = self.gelu(hidden)
+        hidden = self.dropout(hidden)
+        hidden = self.ln(hidden)
+        # Then, project down to the head dimension, resulting in shape: (B, nh, num_blocks, hs).
+        compressed = self.fc2(hidden)
+
+        # Apply residual connection using average pooling over the block tokens
+        residual = x_unfolded.mean(dim=3)  # shape: (B, nh, num_blocks, hs)
+        residual = self.residual_proj(residual)
+        compressed = compressed + residual
+
+        return compressed
         
-        # Store original shape for residual connection
-        x_orig = x_unfolded # (B, nh, num_blocks, hs, L_b)
-        
-        # Apply positional embeddings to the unfolded blocks
-        pos_block = torch.arange(self.block_length, device=x.device)
-        pos_block_emb = self.wpe_block(pos_block).T.view(1, 1, 1, hs, self.block_length)
-        x_unfolded = x_unfolded + pos_block_emb
-        
-        # Apply MLP
-        # Ensure input is contiguous before linear layer if needed
-        x = x_unfolded.contiguous() # Ensure contiguity before fc1
-        x = self.fc1(x) # (B, nh, num_blocks, hs, hidden_dim)
-        x = self.gelu(x)
-        x = self.dropout(x) # Add dropout here
-        x = self.fc2(x)
-        x = x.squeeze(-1)
-        x_orig_proj = self.residual_proj(x_orig).squeeze(-1)
-        x = x + x_orig_proj
-        x = x.clamp(-3, 3)  # Clip final output to [-3, 3]
-        return x
 
 class NativeSparseAttention(nn.Module):
     def __init__(self, config):
@@ -186,13 +205,15 @@ class NativeSparseAttention(nn.Module):
         self.comp_mlp_v = CompressionMLP(config)  # for values
         # self.comp_mlp_q = CompressionMLP(config)  # for queries
 
-        # Gating mechanism (based on input features x, outputting n_embd)
-        self.gate_mlp = nn.Sequential(
+        # Separate gating mechanisms for local and compressed attention paths
+        common_gate_mlp_layers = lambda: nn.Sequential(
             nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias),
             nn.GELU(),
             nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias),
             nn.Sigmoid()
         )
+        self.gate_mlp_local = common_gate_mlp_layers()
+        self.gate_mlp_comp = common_gate_mlp_layers()
 
         # flash attention support
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
@@ -332,10 +353,11 @@ class NativeSparseAttention(nn.Module):
         # Calculate gate based on input features x
         # TODO: Seperate the gates for local and compressed attention.
         # TODO: Try zeros_like(x) and ones_like(x) as gates.
-        gate = self.gate_mlp(x) # (B, T, n_embd)
+        gate_local = self.gate_mlp_local(x) # (B, T, n_embd)
+        gate_comp = self.gate_mlp_comp(x)   # (B, T, n_embd)
         # gate = torch.ones_like(x) # (B, T, n_embd)
         # Apply the n_embd-dimensional gate
-        y_combined_flat = gate * y_local_flat + (1 - gate) * y_comp_flat # (B, T, n_embd)
+        y_combined_flat = gate_local * y_local_flat + gate_comp * y_comp_flat # (B, T, n_embd)
 
         # NOTE: No need to re-assemble head outputs here as y_combined_flat is already (B, T, C)
         y = y_combined_flat
@@ -373,7 +395,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    local_window_size: int = 128  # Size of the local attention window
+    local_window_size: int = 256  # Size of the local attention window
     block_length: int = 8  # Length of each block for sliding window compression
     stride_length: int = 4  # Stride between consecutive blocks for sliding window compression
 
