@@ -133,8 +133,9 @@ class CompressionMLP(nn.Module):
         # T is the sequence length, and hs is the head dimension.
         B, nh, T, hs = x.shape
         if T < self.block_length:
-            # If there are not enough tokens to form a block, return the input unchanged.
-            return x
+            # Return an empty tensor with shape (B, nh, 0, hs)
+            # This correctly signals zero compressed blocks downstream.
+            return torch.empty((B, nh, 0, hs), dtype=x.dtype, device=x.device)
 
         # Unfold the input along the time dimension to partition it into blocks.
         # After unfolding, x_unfolded will have shape (B, nh, num_blocks, hs, block_length),
@@ -395,9 +396,9 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    local_window_size: int = 256  # Size of the local attention window
-    block_length: int = 8  # Length of each block for sliding window compression
-    stride_length: int = 4  # Stride between consecutive blocks for sliding window compression
+    local_window_size: int = 64  # Size of the local attention window
+    block_length: int = 32  # Length of each block for sliding window compression
+    stride_length: int = 28  # Stride between consecutive blocks for sliding window compression
 
 class GPT(nn.Module):   
 
