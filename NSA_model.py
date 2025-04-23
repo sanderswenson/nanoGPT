@@ -53,6 +53,8 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        hs = C // self.n_head # head size
+        nh = self.n_head # number of heads
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
@@ -188,14 +190,17 @@ class NativeSparseAttention(nn.Module):
         assert self.block_length > 0, "block_length must be > 0"
         assert self.stride_length > 0, "stride_length must be > 0"
 
+        # --- Initial Simplification Assertions ---
+        self.num_selected_blocks = config.num_selected_blocks
+        self.selection_block_size = config.selection_block_size
+        #assert self.selection_block_size == self.block_length, "For now, selection_block_size must equal block_length for score calculation"
+        # assert self.stride_length == self.block_length, "DEBUG: Forcing non-overlapping blocks initially"
+        # ----------------------------------------
+
         # Compression MLP (using the new block-based implementation)
         self.comp_mlp = CompressionMLP(config)  # for keys
         self.comp_mlp_v = CompressionMLP(config)  # for values
         # self.comp_mlp_q = CompressionMLP(config)  # for queries
-
-        # LayerNorms for combining pathways
-        self.ln_local = LayerNorm(config.n_embd, bias=config.bias)
-        self.ln_comp = LayerNorm(config.n_embd, bias=config.bias)
 
         # flash attention support
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
@@ -209,10 +214,14 @@ class NativeSparseAttention(nn.Module):
         combined_mask = causal_mask & local_mask
         self.register_buffer("local_causal_allow_mask", combined_mask.view(1, 1, config.block_size, config.block_size))
 
+        # LayerNorm for local pathway before combination
+        self.ln_local = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_comp = LayerNorm(config.n_embd, bias=config.bias)
         
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         hs = C // self.n_head # head size
+        nh = self.n_head # number of heads
 
         # 1. Projections
         # Q is reused
@@ -283,11 +292,16 @@ class NativeSparseAttention(nn.Module):
             att_local = self.attn_dropout(att_local)
             y_local = att_local @ v_local # (B, nh, T, hs)
 
+
+
+
+
         # 5. Calculate Compressed Attention (using q, k_comp, v_comp)
         if num_blocks > 0:
             # Manual implementation with causal masking
-            scale = 1.0 / math.sqrt(k_comp.size(-1))
+            scale = 1.0 / math.sqrt(num_blocks) # Dimension of k_comp is (B, nh, T_comp, hs)
             att_comp = (q @ k_comp.transpose(-2, -1)) * scale  # Shape (B, nh, T, T_comp)
+            "Something right here... gradient is not backpropagating much"
 
             # --- Build Causal Mask for Compressed Attention ---
             # For causal attention, each query token at time step t should only attend to compressed blocks whose start index is <= t.
@@ -319,6 +333,13 @@ class NativeSparseAttention(nn.Module):
             y_comp = torch.zeros_like(y_local)
             
 
+
+
+
+        # NOTE: Token Selection path commented out for now
+        y_slc = torch.zeros_like(y_local) # Ensure y_slc exists as zeros
+        y_slc_flat = y_slc.transpose(1, 2).contiguous().view(B, T, -1)
+
         # 6. Combine Local and Compressed Attentions via Addition
         y_local_flat = y_local.transpose(1, 2).contiguous().view(B, T, -1)
         y_comp_flat = y_comp.transpose(1, 2).contiguous().view(B, T, -1)
@@ -326,10 +347,14 @@ class NativeSparseAttention(nn.Module):
         # Apply LayerNorm before combining
         y_local_flat = self.ln_local(y_local_flat)
         y_comp_flat = self.ln_comp(y_comp_flat)
-        y = y_local_flat + y_comp_flat # Shape: (B, T, n_embd)
 
+        # Combine normalized paths
+        y_combined_flat = y_local_flat + y_comp_flat
 
-        # 7. Output Projection
+        # Output projection layer (c_proj) input dimension is C
+        y = y_combined_flat
+
+        # 7. Final Output Projection
         y = self.resid_dropout(self.c_proj(y))
 
         return y
@@ -359,9 +384,11 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.2
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    local_window_size: int = 64  # Size of the local attention window
-    block_length: int = 32  # Length of each block for sliding window compression
-    stride_length: int = 28  # Stride between consecutive blocks for sliding window compression
+    local_window_size: int = 16  # Size of the local attention window
+    block_length: int = 8  # Length of each block for sliding window compression
+    stride_length: int = 8  # Stride between consecutive blocks for sliding window compression
+    num_selected_blocks: int = 4 # Number of top blocks to select based on relevance
+    selection_block_size: int = 32 # Size of blocks for selection (matched to block_length initially)
 
 class GPT(nn.Module):   
 

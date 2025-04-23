@@ -436,7 +436,13 @@ if master_process: # Only load tokenizer on master process
 def log_gradient_norm_hook(module, grad_input, grad_output, layer_idx, module_name):
     # Log only for layer 0 and every 100 steps to reduce spam
     if layer_idx == 0 and iter_num % 100 == 0 and master_process:
-        grad_norm = grad_output[0].norm().item() if grad_output[0] is not None else 0.0
+        # For dropout, grad_input is relevant; for Linear, grad_output is relevant
+        if isinstance(module, nn.Dropout):
+            grad = grad_input[0]
+        else:
+            grad = grad_output[0]
+
+        grad_norm = grad.norm().item() if grad is not None else 0.0
         print(f"  [L{layer_idx} Grad Norm] {module_name}: {grad_norm:.4f}")
 
 # Get the raw model to access nested modules
@@ -456,29 +462,15 @@ for i, block in enumerate(raw_model.transformer.h):
         # Attach hooks
         # Q projection hook
         if hasattr(block.attn, 'q_proj'):
-            handle = block.attn.q_proj.register_full_backward_hook(make_grad_hook(i, 'q_proj'))
+            handle = block.attn.q_proj.register_full_backward_hook(make_grad_hook(i, 'q_proj')) # Input Q to attention score
             hook_handles.append(handle)
-        handle = block.attn.c_attn_local.register_full_backward_hook(make_grad_hook(i, 'c_attn_local'))
-        hook_handles.append(handle)
-        handle = block.attn.c_attn_comp.register_full_backward_hook(make_grad_hook(i, 'c_attn_comp'))
-        hook_handles.append(handle)
+
+        # Keep hook for Key Compression MLP output gradient
         if hasattr(block.attn, 'comp_mlp') and hasattr(block.attn.comp_mlp, 'fc2'):
-            handle = block.attn.comp_mlp.fc2.register_full_backward_hook(make_grad_hook(i, 'comp_mlp_k.fc2'))
+            handle = block.attn.comp_mlp.fc2.register_full_backward_hook(make_grad_hook(i, 'comp_mlp_k.fc2')) # Input K to attention score (from MLP)
             hook_handles.append(handle)
-        if hasattr(block.attn, 'comp_mlp_v') and hasattr(block.attn.comp_mlp_v, 'fc2'):
-             handle = block.attn.comp_mlp_v.fc2.register_full_backward_hook(make_grad_hook(i, 'comp_mlp_v.fc2'))
-             hook_handles.append(handle)
+
         # Add hooks for the combination LayerNorms
-        if hasattr(block.attn, 'ln_local'):
-            handle = block.attn.ln_local.register_full_backward_hook(make_grad_hook(i, 'ln_local'))
-            hook_handles.append(handle)
-        if hasattr(block.attn, 'ln_comp'):
-            handle = block.attn.ln_comp.register_full_backward_hook(make_grad_hook(i, 'ln_comp'))
-            hook_handles.append(handle)
-        # Restore hook for c_proj if needed for comparison
-        if hasattr(block.attn, 'c_proj'):
-            handle = block.attn.c_proj.register_full_backward_hook(make_grad_hook(i, 'c_proj'))
-            hook_handles.append(handle)
 
 # Optional: Clean up hooks at the end (e.g., in a finally block)
 # for handle in hook_handles:
