@@ -30,6 +30,7 @@ import torch.profiler
 from torch.profiler import profile, record_function, ProfilerActivity
 import tiktoken # Added for sampling if meta.pkl is not found
 import torch.nn as nn
+import torch.nn.functional as F
 
 from model import GPTConfig, GPT
 # --- Debug Imports ---
@@ -126,7 +127,7 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
 # probability of sampling a short sequence
-p_short_seq = 0.2
+p_short_seq = 0.0
 
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
@@ -248,12 +249,120 @@ def estimate_loss():
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
+        # --- Add storage for validation diagnostics ---
+        if split == 'val':
+            logit_means = torch.zeros(eval_iters)
+            logit_stds = torch.zeros(eval_iters)
+            logit_mins = torch.zeros(eval_iters)
+            logit_maxs = torch.zeros(eval_iters)
+            entropies = torch.zeros(eval_iters)
+            # Store top-k from the first batch only
+            first_batch_top_k_info = None
+            # Store attention entropy stats
+            comp_attn_entropies = torch.zeros(eval_iters)
+        # ---------------------------------------------
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
+                # Modify model call to potentially return diagnostics
+                # For now, run separate pass to get internal state (adds overhead)
                 logits, loss = model(X, Y)
+
+                # --- Get Compressed Attention Entropy --- 
+                if split == 'val' and master_process:
+                    with torch.no_grad():
+                        # Rerun first block attention to get internal state 
+                        # NOTE: This is inefficient, ideally modify model forward to return this
+                        raw_model_local = model.module if ddp else model
+                        x_emb = raw_model_local.transformer.drop(raw_model_local.transformer.wte(X) + raw_model_local.transformer.wpe(torch.arange(X.size(1), device=X.device)))
+                        x_ln1 = raw_model_local.transformer.h[0].ln_1(x_emb)
+                        # Call the attention forward pass to get internal att_comp if possible
+                        # This requires NativeSparseAttention to store att_comp as an attribute or return it
+                        # For now, we estimate by recalculating part of it (assuming NativeSparseAttention logic)
+                        # This is approximate and needs NativeSparseAttention modification for accuracy
+                        try:
+                           # --- Replicate att_comp calculation (approximate) --- 
+                           attn_module = raw_model_local.transformer.h[0].attn
+                           hs = attn_module.n_embd // attn_module.n_head
+                           q = attn_module.q_proj(x_ln1).view(X.size(0), X.size(1), attn_module.n_head, hs).transpose(1, 2)
+                           k_comp_raw = attn_module.c_attn_comp(x_ln1).split(attn_module.n_embd, dim=2)[0]
+                           k_comp_raw = k_comp_raw.view(X.size(0), X.size(1), attn_module.n_head, hs).transpose(1, 2)
+                           k_comp = attn_module.comp_mlp(k_comp_raw)
+
+                           if k_comp.size(2) > 0: # If num_blocks > 0
+                                scale = 1.0 / math.sqrt(k_comp.size(-1))
+                                att_scores = (q @ k_comp.transpose(-2, -1)) * scale
+                                
+                                # Recreate causal mask (simplified view for diag.)
+                                T_q = q.size(2)
+                                T_k_comp = att_scores.size(-1)
+                                query_indices = torch.arange(T_q, device=q.device).unsqueeze(1)
+                                block_start_indices = torch.arange(T_k_comp, device=q.device).unsqueeze(0) * attn_module.stride_length
+                                allowed_mask = block_start_indices <= query_indices
+                                causal_mask_bool = ~allowed_mask.unsqueeze(0).unsqueeze(0)
+                                
+                                att_scores = att_scores.masked_fill(causal_mask_bool, float('-inf'))
+                                att_comp_probs = F.softmax(att_scores, dim=-1)
+                                att_comp_probs = torch.nan_to_num(att_comp_probs)
+                                
+                                # Calculate entropy
+                                log_probs_comp = torch.log(att_comp_probs + 1e-9)
+                                entropy_per_attn = -torch.sum(att_comp_probs * log_probs_comp, dim=-1) # Shape (B, nh, T_q)
+                                comp_attn_entropies[k] = entropy_per_attn.mean().item()
+                           else:
+                                comp_attn_entropies[k] = 0.0 # Or NaN, if no blocks
+                        except Exception as e_attn:
+                           print(f"Warning: Failed to calculate att_comp entropy: {e_attn}")
+                           comp_attn_entropies[k] = -1 # Indicate error
+            # -----------------------------------------
+
             losses[k] = loss.item()
+
+            # --- Collect validation diagnostics ---
+            if split == 'val':
+                # 1. Logit Stats
+                logit_means[k] = logits.mean().item()
+                logit_stds[k] = logits.std().item()
+                logit_mins[k] = logits.min().item()
+                logit_maxs[k] = logits.max().item()
+
+                # Calculate probs and entropy
+                # Add epsilon for numerical stability with log(0)
+                probs = F.softmax(logits, dim=-1)
+                log_probs = torch.log(probs + 1e-9)
+                entropy_per_token = -torch.sum(probs * log_probs, dim=-1) # Shape: (B, T)
+                entropies[k] = entropy_per_token.mean().item() # Average over batch and sequence
+
+                # 2. Top-k Probabilities/Tokens (only for first batch, first example)
+                if k == 0 and master_process and decode is not None:
+                    try:
+                        # Get top 5 probs and indices for the last token of the first sequence
+                        top_probs, top_indices = torch.topk(probs[0, -1, :], k=5)
+                        # Decode indices to tokens
+                        top_tokens = [itos[i.item()] for i in top_indices]
+                        first_batch_top_k_info = list(zip(top_tokens, top_probs.tolist()))
+                    except Exception as e:
+                        # Handle potential errors if itos is not loaded or decoding fails
+                        print(f"Warning: Could not decode top-k tokens: {e}")
+                        first_batch_top_k_info = "Decoding unavailable"
+            # ------------------------------------
+
         out[split] = losses.mean()
+
+        # --- Print validation diagnostics (only from master process) ---
+        if split == 'val' and master_process:
+            print("--- Validation Diagnostics ---")
+            print(f"  Avg Logit Stats: Mean={logit_means.mean():.4f}, Std={logit_stds.mean():.4f}, Min={logit_mins.mean():.4f}, Max={logit_maxs.mean():.4f}")
+            print(f"  Avg Prediction Entropy: {entropies.mean():.4f}")
+            if first_batch_top_k_info:
+                print(f"  Top-5 Preds (First Batch, Last Token): {first_batch_top_k_info}")
+            print("----------------------------")
+            # --- Print extra diagnostics ---
+            if split == 'val' and master_process:
+                print(f"  Avg Comp Attention Entropy: {comp_attn_entropies.mean():.4f}")
+                print("----------------------------")
+        # -----------------------------------------------------------
+
     model.train()
     return out
 
@@ -322,6 +431,58 @@ if master_process: # Only load tokenizer on master process
         enc = tiktoken.get_encoding("gpt2")
         encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
         decode = lambda l: enc.decode(l)
+
+# Backward hook to log gradient norms
+def log_gradient_norm_hook(module, grad_input, grad_output, layer_idx, module_name):
+    # Log only for layer 0 and every 100 steps to reduce spam
+    if layer_idx == 0 and iter_num % 100 == 0 and master_process:
+        grad_norm = grad_output[0].norm().item() if grad_output[0] is not None else 0.0
+        print(f"  [L{layer_idx} Grad Norm] {module_name}: {grad_norm:.4f}")
+
+# Get the raw model to access nested modules
+raw_model = model.module if ddp else model
+
+# Attach gradient logging hooks
+hook_handles = [] # Store hook handles to remove them later if needed
+for i, block in enumerate(raw_model.transformer.h):
+    if hasattr(block, 'attn') and hasattr(block.attn, 'c_attn_local'): # Check necessary components exist
+        # Factory function to capture layer index and name
+        def make_grad_hook(layer_idx, module_name):
+            # Note: Need to pass the actual hook function here
+            def hook_wrapper(module, grad_input, grad_output):
+                log_gradient_norm_hook(module, grad_input, grad_output, layer_idx, module_name)
+            return hook_wrapper
+
+        # Attach hooks
+        # Q projection hook
+        if hasattr(block.attn, 'q_proj'):
+            handle = block.attn.q_proj.register_full_backward_hook(make_grad_hook(i, 'q_proj'))
+            hook_handles.append(handle)
+        handle = block.attn.c_attn_local.register_full_backward_hook(make_grad_hook(i, 'c_attn_local'))
+        hook_handles.append(handle)
+        handle = block.attn.c_attn_comp.register_full_backward_hook(make_grad_hook(i, 'c_attn_comp'))
+        hook_handles.append(handle)
+        if hasattr(block.attn, 'comp_mlp') and hasattr(block.attn.comp_mlp, 'fc2'):
+            handle = block.attn.comp_mlp.fc2.register_full_backward_hook(make_grad_hook(i, 'comp_mlp_k.fc2'))
+            hook_handles.append(handle)
+        if hasattr(block.attn, 'comp_mlp_v') and hasattr(block.attn.comp_mlp_v, 'fc2'):
+             handle = block.attn.comp_mlp_v.fc2.register_full_backward_hook(make_grad_hook(i, 'comp_mlp_v.fc2'))
+             hook_handles.append(handle)
+        # Add hooks for the combination LayerNorms
+        if hasattr(block.attn, 'ln_local'):
+            handle = block.attn.ln_local.register_full_backward_hook(make_grad_hook(i, 'ln_local'))
+            hook_handles.append(handle)
+        if hasattr(block.attn, 'ln_comp'):
+            handle = block.attn.ln_comp.register_full_backward_hook(make_grad_hook(i, 'ln_comp'))
+            hook_handles.append(handle)
+        # Restore hook for c_proj if needed for comparison
+        if hasattr(block.attn, 'c_proj'):
+            handle = block.attn.c_proj.register_full_backward_hook(make_grad_hook(i, 'c_proj'))
+            hook_handles.append(handle)
+
+# Optional: Clean up hooks at the end (e.g., in a finally block)
+# for handle in hook_handles:
+#    handle.remove()
 
 try:
     while True:

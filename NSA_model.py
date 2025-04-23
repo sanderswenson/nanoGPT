@@ -113,14 +113,9 @@ class CompressionMLP(nn.Module):
         self.wpe_block = nn.Embedding(config.block_length, self.hs)
 
         # Define a two-layer MLP for gentle compression.
-        # The idea is to flatten each block (of shape [block_length, hs]) into a vector of size (hs * block_length).
-        # Then, we use an MLP to compress this high-dimensional vector into a compact representation of dimension hs,
-        # which is compatible with subsequent attention computations.
-        # Here, we choose a hidden dimension that is half of the flattened dimension as a moderate choice.
         hidden_dim = (self.hs * config.block_length)
         self.fc1 = nn.Linear(self.hs * config.block_length, hidden_dim, bias=config.bias)
         self.gelu = nn.GELU()
-        self.ln = nn.LayerNorm(hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, self.hs, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout if hasattr(config, 'dropout') else 0.1)
 
@@ -155,22 +150,13 @@ class CompressionMLP(nn.Module):
         x_unfolded = x_unfolded + pos_emb
 
         # Flatten the block tokens: combine the block_length and hs dimensions into one vector.
-        # New shape: (B, nh, num_blocks, hs * block_length).
         x_flat = x_unfolded.contiguous().view(B, nh, num_blocks, hs * self.block_length)
 
         # Pass the flattened block through a two-layer MLP to obtain a compressed representation.
-        # First, project to a hidden space, apply GELU activation and dropout for regularization.
         hidden = self.fc1(x_flat)       # shape: (B, nh, num_blocks, hidden_dim)
         hidden = self.gelu(hidden)
         hidden = self.dropout(hidden)
-        hidden = self.ln(hidden)
-        # Then, project down to the head dimension, resulting in shape: (B, nh, num_blocks, hs).
         compressed = self.fc2(hidden)
-
-        # Apply residual connection using average pooling over the block tokens
-        residual = x_unfolded.mean(dim=3)  # shape: (B, nh, num_blocks, hs)
-        residual = self.residual_proj(residual)
-        compressed = compressed + residual
 
         return compressed
         
@@ -181,7 +167,8 @@ class NativeSparseAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
         self.hs = config.n_embd // config.n_head # Head size calculation
         # Local/Window attention projections (Q, K, V)
-        self.c_attn_local = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.q_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.c_attn_local = nn.Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)
         # Compressed attention projections (K, V only)
         self.c_attn_comp = nn.Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)
 
@@ -206,15 +193,9 @@ class NativeSparseAttention(nn.Module):
         self.comp_mlp_v = CompressionMLP(config)  # for values
         # self.comp_mlp_q = CompressionMLP(config)  # for queries
 
-        # Separate gating mechanisms for local and compressed attention paths
-        common_gate_mlp_layers = lambda: nn.Sequential(
-            nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias),
-            nn.GELU(),
-            nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias),
-            nn.Sigmoid()
-        )
-        self.gate_mlp_local = common_gate_mlp_layers()
-        self.gate_mlp_comp = common_gate_mlp_layers()
+        # LayerNorms for combining pathways
+        self.ln_local = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_comp = LayerNorm(config.n_embd, bias=config.bias)
 
         # flash attention support
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
@@ -234,9 +215,11 @@ class NativeSparseAttention(nn.Module):
         hs = C // self.n_head # head size
 
         # 1. Projections
-        # Local/Window (Q, K, V) - Q is reused for compressed attention
-        q, k_local, v_local = self.c_attn_local(x).split(self.n_embd, dim=2)
-        # Compressed (K, V only)
+        # Q is reused
+        q = self.q_proj(x)
+        # Local/Window (K, V)
+        k_local, v_local = self.c_attn_local(x).split(self.n_embd, dim=2)
+        # Compressed (K, V)
         k_comp_raw, v_comp_raw = self.c_attn_comp(x).split(self.n_embd, dim=2)
         
         # Reshape Q, K_local, V_local for local attention
@@ -249,7 +232,7 @@ class NativeSparseAttention(nn.Module):
 
 
 
-####################### Somewhere outside of these two lines is the issue.
+####################### Restoring Compressed Path #######################
 
 
         # 2. Compression (using k_comp_raw, v_comp_raw)
@@ -334,40 +317,20 @@ class NativeSparseAttention(nn.Module):
             y_comp = att_comp @ v_comp # (B, nh, T, hs)
         else:
             y_comp = torch.zeros_like(y_local)
+            
 
-        # --- DEBUG Prints (Optional) --- 
-        # if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
-        #      print(f"DEBUG y_local mag: {torch.mean(torch.abs(y_local)):.4f} std: {torch.std(y_local):.4f}")
-        #      print(f"DEBUG y_comp mag:  {torch.mean(torch.abs(y_comp)):.4f} std: {torch.std(y_comp):.4f}")
-        #      print(f"DEBUG g_local mag: {torch.mean(torch.abs(g_local)):.4f} std: {torch.std(g_local):.4f}") # Added gate debug
-        #      print(f"DEBUG g_comp mag:  {torch.mean(torch.abs(g_comp)):.4f} std: {torch.std(g_comp):.4f}")  # Added gate debug
-        # --- END DEBUG ---
-
-        # 6. Combine Local and Compressed Attentions using per-dimension gating
-        # Reshape attention outputs to (B, T, n_embd) for gating
+        # 6. Combine Local and Compressed Attentions via Addition
         y_local_flat = y_local.transpose(1, 2).contiguous().view(B, T, -1)
-        # TODO: Confirm that y_comp is not producing pathological outputs.
         y_comp_flat = y_comp.transpose(1, 2).contiguous().view(B, T, -1)
-        # print(f"y_comp_flat shape: {y_comp_flat.shape}")
-        # print(f"y_comp_flat full tensor:\n{y_comp_flat.detach().cpu().numpy()}")
 
-        # Calculate gate based on input features x
-        # TODO: Seperate the gates for local and compressed attention.
-        # TODO: Try zeros_like(x) and ones_like(x) as gates.
-        gate_local = self.gate_mlp_local(x) # (B, T, n_embd)
-        gate_comp = self.gate_mlp_comp(x)   # (B, T, n_embd)
-        # gate = torch.ones_like(x) # (B, T, n_embd)
-        # Apply the n_embd-dimensional gate
-        y_combined_flat = gate_local * y_local_flat + gate_comp * y_comp_flat # (B, T, n_embd)
+        # Apply LayerNorm before combining
+        y_local_flat = self.ln_local(y_local_flat)
+        y_comp_flat = self.ln_comp(y_comp_flat)
+        y = y_local_flat + y_comp_flat # Shape: (B, T, n_embd)
 
-        # NOTE: No need to re-assemble head outputs here as y_combined_flat is already (B, T, C)
-        y = y_combined_flat
 
         # 7. Output Projection
         y = self.resid_dropout(self.c_proj(y))
-
-        # if self.training:
-        #     print("DEBUG: gate stats: mean={:.4f}, std={:.4f}, min={:.4f}, max={:.4f}".format(gate.mean().item(), gate.std().item(), gate.min().item(), gate.max().item()))
 
         return y
 
@@ -394,7 +357,7 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
-    dropout: float = 0.0
+    dropout: float = 0.2
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     local_window_size: int = 64  # Size of the local attention window
     block_length: int = 32  # Length of each block for sliding window compression
