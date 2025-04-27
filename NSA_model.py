@@ -193,7 +193,10 @@ class NativeSparseAttention(nn.Module):
         # Compression MLP (using the new block-based implementation)
         self.comp_mlp = CompressionMLP(config)  # for keys
         self.comp_mlp_v = CompressionMLP(config)  # for values
-        # self.comp_mlp_q = CompressionMLP(config)  # for queries
+
+        # LayerNorms for combining pathways
+        self.ln_local = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_comp = LayerNorm(config.n_embd, bias=config.bias)
 
         # flash attention support
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
@@ -213,16 +216,43 @@ class NativeSparseAttention(nn.Module):
         nh = self.n_head # number of heads
 
         # 1. Projections
-        # Q, K, V for local window
+        # Q is reused
         q = self.q_proj(x)
-        k, v = self.c_attn_local(x).split(self.n_embd, dim=2)
+        # Local/Window (K, V)
+        k_local, v_local = self.c_attn_local(x).split(self.n_embd, dim=2)
+        # Compressed (K, V)
+        k_comp_raw, v_comp_raw = self.c_attn_comp(x).split(self.n_embd, dim=2)
         
         # Reshape Q, K_local, V_local for local attention
         q = q.view(B, T, self.n_head, hs).transpose(1, 2) # (B, nh, T, hs)
-        k = k.view(B, T, self.n_head, hs).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, hs).transpose(1, 2) # (B, nh, T, hs)
+        k_local = k_local.view(B, T, self.n_head, hs).transpose(1, 2) # (B, nh, T, hs)
+        v_local = v_local.view(B, T, self.n_head, hs).transpose(1, 2) # (B, nh, T, hs)
+        # Reshape K_comp_raw, V_comp_raw for compression steps
+        k_comp_raw = k_comp_raw.view(B, T, self.n_head, hs).transpose(1, 2) # (B, nh, T_comp, hs)
+        v_comp_raw = v_comp_raw.view(B, T, self.n_head, hs).transpose(1, 2) # (B, nh, T_comp, hs)
 
-        # NOTE: Compression path is disabled for this ablation study
+
+
+####################### Restoring Compressed Path #######################
+
+
+        # 2. Compression (using k_comp_raw, v_comp_raw)
+        # Apply compression MLP directly (unfold is now handled inside the MLP)
+        k_comp = self.comp_mlp(k_comp_raw) # (B, nh, num_blocks, hs)
+        v_comp = self.comp_mlp_v(v_comp_raw) # (B, nh, num_blocks, hs)
+
+
+#######################
+
+
+        # Get the number of blocks for later use
+        if T < self.block_length:
+            num_blocks = 0
+            T_comp = 0
+        else:
+            num_blocks = k_comp.size(2)
+            T_comp = num_blocks
+            
 
         # 4. Calculate Local Attention (using q, k_local, v_local)
         attn_mask_local = self.local_causal_allow_mask[:, :, :T, :T].expand(B, self.n_head, T, T)
@@ -230,24 +260,22 @@ class NativeSparseAttention(nn.Module):
             # ... (flash attention for local - unchanged) ...
             try:
                 y_local = torch.nn.functional.scaled_dot_product_attention(
-                    q, k, v,
+                    q, k_local, v_local,
                     attn_mask=attn_mask_local,
                     dropout_p=self.dropout if self.training else 0,
                     is_causal=False
                 )
             except RuntimeError as e:
-                print(f"Flash attention failed with explicit mask: {e}. Falling back.")
+                print(f"Flash attention failed with explicit mask: {e}. Falling back to manual calculation.")
                 # Manual calculation fallback
-                att_local = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+                att_local = (q @ k_local.transpose(-2, -1)) * (1.0 / math.sqrt(k_local.size(-1)))
                 attn_mask_local_bool = ~self.local_causal_allow_mask[:, :, :T, :T] # Invert the mask
                 att_local = att_local.masked_fill(attn_mask_local_bool.expand(B, self.n_head, T, T), float('-inf'))
                 att_local = F.softmax(att_local, dim=-1)
                 att_local = self.attn_dropout(att_local)
-                y_local = att_local @ v # (B, nh, T, hs)
+                y_local = att_local @ v_local # (B, nh, T, hs)
         else:
             # Manual implementation
-            # print("Manual implementation of local attention")
-            att_local = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             print("Manual implementation of local attention")
             att_local = (q @ k_local.transpose(-2, -1)) * (1.0 / math.sqrt(k_local.size(-1)))
             attn_mask_local_bool = ~self.local_causal_allow_mask[:, :, :T, :T]
@@ -294,22 +322,26 @@ class NativeSparseAttention(nn.Module):
             att_comp = self.attn_dropout(att_comp)
             y_comp = att_comp @ v_comp # (B, nh, T, hs)
         else:
-            y_comp = torch.zeros_like(y_local)
+            y_comp = None # Indicate no compressed output calculated
             
 
 
 
 
         # 6. Combine Local and Compressed Attentions via Addition
+        # NOTE: LayerNorms are so vital. 
         y_local_flat = y_local.transpose(1, 2).contiguous().view(B, T, -1)
-        y_comp_flat = y_comp.transpose(1, 2).contiguous().view(B, T, -1)
 
         # Apply LayerNorm before combining
         y_local_flat = self.ln_local(y_local_flat)
-        y_comp_flat = self.ln_comp(y_comp_flat)
 
         # Combine normalized paths
-        y_combined_flat = y_local_flat + y_comp_flat
+        if y_comp is not None: # Check if compressed path was active
+            y_comp_flat = y_comp.transpose(1, 2).contiguous().view(B, T, -1)
+            y_comp_flat = self.ln_comp(y_comp_flat) # Normalize if exists
+            y_combined_flat = y_local_flat + y_comp_flat # Add normalized components
+        else:
+            y_combined_flat = y_local_flat # Use only normalized local path
 
         # NOTE: Output projection layer (c_proj) input dimension is C
         y = y_combined_flat
@@ -348,9 +380,9 @@ class GPTConfig:
     # Should be context size/16 according to the paper
     local_window_size: int = 12  # Size of the local attention window
     # Should be context size/64 according to the paper
-    block_length: int = 4  # Length of each block for sliding window compression
+    block_length: int = 2  # Length of each block for sliding window compression
     # These should be equal for now
-    stride_length: int = 4  # Stride between consecutive blocks for sliding window compression
+    stride_length: int = 2  # Stride between consecutive blocks for sliding window compression
 
 class GPT(nn.Module):   
 

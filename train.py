@@ -47,6 +47,7 @@ eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+ckpt_name = 'ckpt.pt' # name of the checkpoint file to load/save
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
@@ -189,7 +190,7 @@ if init_from == 'scratch':
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    ckpt_path = os.path.join(out_dir, ckpt_name)
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
@@ -432,50 +433,6 @@ if master_process: # Only load tokenizer on master process
         encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
         decode = lambda l: enc.decode(l)
 
-# Backward hook to log gradient norms
-def log_gradient_norm_hook(module, grad_input, grad_output, layer_idx, module_name):
-    # Log only for layer 0 and every 100 steps to reduce spam
-    if layer_idx == 0 and iter_num % 100 == 0 and master_process:
-        # For dropout, grad_input is relevant; for Linear, grad_output is relevant
-        if isinstance(module, nn.Dropout):
-            grad = grad_input[0]
-        else:
-            grad = grad_output[0]
-
-        grad_norm = grad.norm().item() if grad is not None else 0.0
-        print(f"  [L{layer_idx} Grad Norm] {module_name}: {grad_norm:.4f}")
-
-# Get the raw model to access nested modules
-raw_model = model.module if ddp else model
-
-# Attach gradient logging hooks
-hook_handles = [] # Store hook handles to remove them later if needed
-for i, block in enumerate(raw_model.transformer.h):
-    if hasattr(block, 'attn') and hasattr(block.attn, 'c_attn_local'): # Check necessary components exist
-        # Factory function to capture layer index and name
-        def make_grad_hook(layer_idx, module_name):
-            # Note: Need to pass the actual hook function here
-            def hook_wrapper(module, grad_input, grad_output):
-                log_gradient_norm_hook(module, grad_input, grad_output, layer_idx, module_name)
-            return hook_wrapper
-
-        # Attach hooks
-        # Q projection hook
-        if hasattr(block.attn, 'q_proj'):
-            handle = block.attn.q_proj.register_full_backward_hook(make_grad_hook(i, 'q_proj')) # Input Q to attention score
-            hook_handles.append(handle)
-
-        # Keep hook for Key Compression MLP output gradient
-        if hasattr(block.attn, 'comp_mlp') and hasattr(block.attn.comp_mlp, 'fc2'):
-            handle = block.attn.comp_mlp.fc2.register_full_backward_hook(make_grad_hook(i, 'comp_mlp_k.fc2')) # Input K to attention score (from MLP)
-            hook_handles.append(handle)
-
-        # Add hooks for the combination LayerNorms
-
-# Optional: Clean up hooks at the end (e.g., in a finally block)
-# for handle in hook_handles:
-#    handle.remove()
-
 try:
     while True:
         # determine and set the learning rate for this iteration
@@ -525,7 +482,7 @@ try:
                                 'config': config,
                             }
                             print(f"saving checkpoint to {out_dir}")
-                            torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                            torch.save(checkpoint, os.path.join(out_dir, ckpt_name))
             if iter_num == 0 and eval_only:
                 break
 
