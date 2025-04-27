@@ -190,13 +190,6 @@ class NativeSparseAttention(nn.Module):
         assert self.block_length > 0, "block_length must be > 0"
         assert self.stride_length > 0, "stride_length must be > 0"
 
-        # --- Initial Simplification Assertions ---
-        self.num_selected_blocks = config.num_selected_blocks
-        self.selection_block_size = config.selection_block_size
-        #assert self.selection_block_size == self.block_length, "For now, selection_block_size must equal block_length for score calculation"
-        # assert self.stride_length == self.block_length, "DEBUG: Forcing non-overlapping blocks initially"
-        # ----------------------------------------
-
         # Compression MLP (using the new block-based implementation)
         self.comp_mlp = CompressionMLP(config)  # for keys
         self.comp_mlp_v = CompressionMLP(config)  # for values
@@ -213,10 +206,6 @@ class NativeSparseAttention(nn.Module):
         local_mask = (col_indices > (row_indices - self.local_window_size)) & (col_indices <= row_indices)
         combined_mask = causal_mask & local_mask
         self.register_buffer("local_causal_allow_mask", combined_mask.view(1, 1, config.block_size, config.block_size))
-
-        # LayerNorm for local pathway before combination
-        self.ln_local = LayerNorm(config.n_embd, bias=config.bias)
-        self.ln_comp = LayerNorm(config.n_embd, bias=config.bias)
         
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -224,43 +213,16 @@ class NativeSparseAttention(nn.Module):
         nh = self.n_head # number of heads
 
         # 1. Projections
-        # Q is reused
+        # Q, K, V for local window
         q = self.q_proj(x)
-        # Local/Window (K, V)
-        k_local, v_local = self.c_attn_local(x).split(self.n_embd, dim=2)
-        # Compressed (K, V)
-        k_comp_raw, v_comp_raw = self.c_attn_comp(x).split(self.n_embd, dim=2)
+        k, v = self.c_attn_local(x).split(self.n_embd, dim=2)
         
         # Reshape Q, K_local, V_local for local attention
         q = q.view(B, T, self.n_head, hs).transpose(1, 2) # (B, nh, T, hs)
-        k_local = k_local.view(B, T, self.n_head, hs).transpose(1, 2) # (B, nh, T, hs)
-        v_local = v_local.view(B, T, self.n_head, hs).transpose(1, 2) # (B, nh, T, hs)
-        # Reshape K_comp_raw, V_comp_raw for compression steps
-        k_comp_raw = k_comp_raw.view(B, T, self.n_head, hs).transpose(1, 2) # (B, nh, T_comp, hs)
-        v_comp_raw = v_comp_raw.view(B, T, self.n_head, hs).transpose(1, 2) # (B, nh, T_comp, hs)
+        k = k.view(B, T, self.n_head, hs).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, hs).transpose(1, 2) # (B, nh, T, hs)
 
-
-
-####################### Restoring Compressed Path #######################
-
-
-        # 2. Compression (using k_comp_raw, v_comp_raw)
-        # Apply compression MLP directly (unfold is now handled inside the MLP)
-        k_comp = self.comp_mlp(k_comp_raw) # (B, nh, num_blocks, hs)
-        v_comp = self.comp_mlp_v(v_comp_raw) # (B, nh, num_blocks, hs)
-
-
-#######################
-
-
-        # Get the number of blocks for later use
-        if T < self.block_length:
-            num_blocks = 0
-            T_comp = 0
-        else:
-            num_blocks = k_comp.size(2)
-            T_comp = num_blocks
-            
+        # NOTE: Compression path is disabled for this ablation study
 
         # 4. Calculate Local Attention (using q, k_local, v_local)
         attn_mask_local = self.local_causal_allow_mask[:, :, :T, :T].expand(B, self.n_head, T, T)
@@ -268,22 +230,24 @@ class NativeSparseAttention(nn.Module):
             # ... (flash attention for local - unchanged) ...
             try:
                 y_local = torch.nn.functional.scaled_dot_product_attention(
-                    q, k_local, v_local,
+                    q, k, v,
                     attn_mask=attn_mask_local,
                     dropout_p=self.dropout if self.training else 0,
                     is_causal=False
                 )
             except RuntimeError as e:
-                print(f"Flash attention failed with explicit mask: {e}. Falling back to manual calculation.")
+                print(f"Flash attention failed with explicit mask: {e}. Falling back.")
                 # Manual calculation fallback
-                att_local = (q @ k_local.transpose(-2, -1)) * (1.0 / math.sqrt(k_local.size(-1)))
+                att_local = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
                 attn_mask_local_bool = ~self.local_causal_allow_mask[:, :, :T, :T] # Invert the mask
                 att_local = att_local.masked_fill(attn_mask_local_bool.expand(B, self.n_head, T, T), float('-inf'))
                 att_local = F.softmax(att_local, dim=-1)
                 att_local = self.attn_dropout(att_local)
-                y_local = att_local @ v_local # (B, nh, T, hs)
+                y_local = att_local @ v # (B, nh, T, hs)
         else:
             # Manual implementation
+            # print("Manual implementation of local attention")
+            att_local = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             print("Manual implementation of local attention")
             att_local = (q @ k_local.transpose(-2, -1)) * (1.0 / math.sqrt(k_local.size(-1)))
             attn_mask_local_bool = ~self.local_causal_allow_mask[:, :, :T, :T]
@@ -336,10 +300,6 @@ class NativeSparseAttention(nn.Module):
 
 
 
-        # NOTE: Token Selection path commented out for now
-        y_slc = torch.zeros_like(y_local) # Ensure y_slc exists as zeros
-        y_slc_flat = y_slc.transpose(1, 2).contiguous().view(B, T, -1)
-
         # 6. Combine Local and Compressed Attentions via Addition
         y_local_flat = y_local.transpose(1, 2).contiguous().view(B, T, -1)
         y_comp_flat = y_comp.transpose(1, 2).contiguous().view(B, T, -1)
@@ -351,7 +311,7 @@ class NativeSparseAttention(nn.Module):
         # Combine normalized paths
         y_combined_flat = y_local_flat + y_comp_flat
 
-        # Output projection layer (c_proj) input dimension is C
+        # NOTE: Output projection layer (c_proj) input dimension is C
         y = y_combined_flat
 
         # 7. Final Output Projection
@@ -384,11 +344,13 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.2
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    local_window_size: int = 16  # Size of the local attention window
-    block_length: int = 8  # Length of each block for sliding window compression
-    stride_length: int = 8  # Stride between consecutive blocks for sliding window compression
-    num_selected_blocks: int = 4 # Number of top blocks to select based on relevance
-    selection_block_size: int = 32 # Size of blocks for selection (matched to block_length initially)
+    # NSA parameters
+    # Should be context size/16 according to the paper
+    local_window_size: int = 12  # Size of the local attention window
+    # Should be context size/64 according to the paper
+    block_length: int = 4  # Length of each block for sliding window compression
+    # These should be equal for now
+    stride_length: int = 4  # Stride between consecutive blocks for sliding window compression
 
 class GPT(nn.Module):   
 
