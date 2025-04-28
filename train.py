@@ -62,7 +62,7 @@ n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # LabelSmoothing
-label_smoothing = 0.0
+label_smoothing = 0.05
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -241,7 +241,10 @@ if compile:
 
 # wrap model into DDP container
 if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
+    # Add find_unused_parameters=True to handle cases where not all parameters
+    # are used in every forward pass, which can happen in certain model
+    # configurations or conditional logic within the model.
+    model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()

@@ -291,7 +291,7 @@ class NativeSparseAttention(nn.Module):
         # 5. Calculate Compressed Attention (using q, k_comp, v_comp)
         if num_blocks > 0:
             # Manual implementation with causal masking
-            scale = 1.0 / math.sqrt(num_blocks) # Dimension of k_comp is (B, nh, T_comp, hs)
+            scale = 1.0 / math.sqrt(k_comp.size(-1)) # Standard scaling by sqrt(key_dim)
             att_comp = (q @ k_comp.transpose(-2, -1)) * scale  # Shape (B, nh, T, T_comp)
             "Something right here... gradient is not backpropagating much"
 
@@ -336,6 +336,7 @@ class NativeSparseAttention(nn.Module):
         y_local_flat = self.ln_local(y_local_flat)
 
         # Combine normalized paths
+        # TODO: add gating again.
         if y_comp is not None: # Check if compressed path was active
             y_comp_flat = y_comp.transpose(1, 2).contiguous().view(B, T, -1)
             y_comp_flat = self.ln_comp(y_comp_flat) # Normalize if exists
