@@ -26,8 +26,6 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
-import torch.profiler
-from torch.profiler import profile, record_function, ProfilerActivity
 import tiktoken # Added for sampling if meta.pkl is not found
 import torch.nn as nn
 import torch.nn.functional as F
@@ -63,6 +61,8 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+# LabelSmoothing
+label_smoothing = 0.0
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -250,120 +250,15 @@ def estimate_loss():
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
-        # --- Add storage for validation diagnostics ---
-        if split == 'val':
-            logit_means = torch.zeros(eval_iters)
-            logit_stds = torch.zeros(eval_iters)
-            logit_mins = torch.zeros(eval_iters)
-            logit_maxs = torch.zeros(eval_iters)
-            entropies = torch.zeros(eval_iters)
-            # Store top-k from the first batch only
-            first_batch_top_k_info = None
-            # Store attention entropy stats
-            comp_attn_entropies = torch.zeros(eval_iters)
-        # ---------------------------------------------
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                # Modify model call to potentially return diagnostics
-                # For now, run separate pass to get internal state (adds overhead)
-                logits, loss = model(X, Y)
-
-                # --- Get Compressed Attention Entropy --- 
-                if split == 'val' and master_process:
-                    with torch.no_grad():
-                        # Rerun first block attention to get internal state 
-                        # NOTE: This is inefficient, ideally modify model forward to return this
-                        raw_model_local = model.module if ddp else model
-                        x_emb = raw_model_local.transformer.drop(raw_model_local.transformer.wte(X) + raw_model_local.transformer.wpe(torch.arange(X.size(1), device=X.device)))
-                        x_ln1 = raw_model_local.transformer.h[0].ln_1(x_emb)
-                        # Call the attention forward pass to get internal att_comp if possible
-                        # This requires NativeSparseAttention to store att_comp as an attribute or return it
-                        # For now, we estimate by recalculating part of it (assuming NativeSparseAttention logic)
-                        # This is approximate and needs NativeSparseAttention modification for accuracy
-                        try:
-                           # --- Replicate att_comp calculation (approximate) --- 
-                           attn_module = raw_model_local.transformer.h[0].attn
-                           hs = attn_module.n_embd // attn_module.n_head
-                           q = attn_module.q_proj(x_ln1).view(X.size(0), X.size(1), attn_module.n_head, hs).transpose(1, 2)
-                           k_comp_raw = attn_module.c_attn_comp(x_ln1).split(attn_module.n_embd, dim=2)[0]
-                           k_comp_raw = k_comp_raw.view(X.size(0), X.size(1), attn_module.n_head, hs).transpose(1, 2)
-                           k_comp = attn_module.comp_mlp(k_comp_raw)
-
-                           if k_comp.size(2) > 0: # If num_blocks > 0
-                                scale = 1.0 / math.sqrt(k_comp.size(-1))
-                                att_scores = (q @ k_comp.transpose(-2, -1)) * scale
-                                
-                                # Recreate causal mask (simplified view for diag.)
-                                T_q = q.size(2)
-                                T_k_comp = att_scores.size(-1)
-                                query_indices = torch.arange(T_q, device=q.device).unsqueeze(1)
-                                block_start_indices = torch.arange(T_k_comp, device=q.device).unsqueeze(0) * attn_module.stride_length
-                                allowed_mask = block_start_indices <= query_indices
-                                causal_mask_bool = ~allowed_mask.unsqueeze(0).unsqueeze(0)
-                                
-                                att_scores = att_scores.masked_fill(causal_mask_bool, float('-inf'))
-                                att_comp_probs = F.softmax(att_scores, dim=-1)
-                                att_comp_probs = torch.nan_to_num(att_comp_probs)
-                                
-                                # Calculate entropy
-                                log_probs_comp = torch.log(att_comp_probs + 1e-9)
-                                entropy_per_attn = -torch.sum(att_comp_probs * log_probs_comp, dim=-1) # Shape (B, nh, T_q)
-                                comp_attn_entropies[k] = entropy_per_attn.mean().item()
-                           else:
-                                comp_attn_entropies[k] = 0.0 # Or NaN, if no blocks
-                        except Exception as e_attn:
-                           print(f"Warning: Failed to calculate att_comp entropy: {e_attn}")
-                           comp_attn_entropies[k] = -1 # Indicate error
-            # -----------------------------------------
+                logits, _ = model(X, Y) # Get logits only
+                # Calculate loss WITHOUT label smoothing for evaluation
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), Y.view(-1), ignore_index=-1)
 
             losses[k] = loss.item()
-
-            # --- Collect validation diagnostics ---
-            if split == 'val':
-                # 1. Logit Stats
-                logit_means[k] = logits.mean().item()
-                logit_stds[k] = logits.std().item()
-                logit_mins[k] = logits.min().item()
-                logit_maxs[k] = logits.max().item()
-
-                # Calculate probs and entropy
-                # Add epsilon for numerical stability with log(0)
-                probs = F.softmax(logits, dim=-1)
-                log_probs = torch.log(probs + 1e-9)
-                entropy_per_token = -torch.sum(probs * log_probs, dim=-1) # Shape: (B, T)
-                entropies[k] = entropy_per_token.mean().item() # Average over batch and sequence
-
-                # 2. Top-k Probabilities/Tokens (only for first batch, first example)
-                if k == 0 and master_process and decode is not None:
-                    try:
-                        # Get top 5 probs and indices for the last token of the first sequence
-                        top_probs, top_indices = torch.topk(probs[0, -1, :], k=5)
-                        # Decode indices to tokens
-                        top_tokens = [itos[i.item()] for i in top_indices]
-                        first_batch_top_k_info = list(zip(top_tokens, top_probs.tolist()))
-                    except Exception as e:
-                        # Handle potential errors if itos is not loaded or decoding fails
-                        print(f"Warning: Could not decode top-k tokens: {e}")
-                        first_batch_top_k_info = "Decoding unavailable"
-            # ------------------------------------
-
         out[split] = losses.mean()
-
-        # --- Print validation diagnostics (only from master process) ---
-        if split == 'val' and master_process:
-            print("--- Validation Diagnostics ---")
-            print(f"  Avg Logit Stats: Mean={logit_means.mean():.4f}, Std={logit_stds.mean():.4f}, Min={logit_mins.mean():.4f}, Max={logit_maxs.mean():.4f}")
-            print(f"  Avg Prediction Entropy: {entropies.mean():.4f}")
-            if first_batch_top_k_info:
-                print(f"  Top-5 Preds (First Batch, Last Token): {first_batch_top_k_info}")
-            print("----------------------------")
-            # --- Print extra diagnostics ---
-            if split == 'val' and master_process:
-                print(f"  Avg Comp Attention Entropy: {comp_attn_entropies.mean():.4f}")
-                print("----------------------------")
-        # -----------------------------------------------------------
-
     model.train()
     return out
 
@@ -387,27 +282,6 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-if master_process:  # Only profile on the master process
-    prof = torch.profiler.profile(
-        activities=[
-            ProfilerActivity.CPU,
-            ProfilerActivity.CUDA,
-        ],
-        schedule=torch.profiler.schedule(
-            wait=1,      # Skip first iteration
-            warmup=1,    # Warmup for one iteration
-            active=3,    # Profile for 3 iterations
-            repeat=1     # Stop after one cycle
-        ),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/pytorch_profiler'),
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True
-    )
-    prof.start()
-else:
-    prof = nullcontext()
-
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
@@ -440,84 +314,77 @@ try:
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
-        with record_function("train_step"):
-            # evaluate the loss on train/val sets and write checkpoints
-            if iter_num % eval_interval == 0 and master_process:
-                with record_function("evaluation"):
-                    losses = estimate_loss()
-                print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        # evaluate the loss on train/val sets and write checkpoints
+        if iter_num % eval_interval == 0 and master_process:
+            losses = estimate_loss()
+            print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
-                # ---- GENERATION START ----
-                if iter_num > 0: # Avoid sampling at iteration 0
-                    print("--- Generating Sample ---")
-                    raw_model.eval() # Set model to eval mode for generation
-                    start_ids = encode(sample_start)
-                    x_sample = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
-                    with torch.no_grad():
-                        with ctx: # Use the same autocast context
-                           y_sample = raw_model.generate(x_sample, sample_max_new_tokens, temperature=sample_temperature, top_k=sample_top_k)
-                    print(decode(y_sample[0].tolist()))
-                    print("-------------------------")
-                    raw_model.train() # Set model back to train mode
-                # ---- GENERATION END ----
+            # ---- GENERATION START ----
+            if iter_num > 0: # Avoid sampling at iteration 0
+                print("--- Generating Sample ---")
+                raw_model.eval() # Set model to eval mode for generation
+                start_ids = encode(sample_start)
+                x_sample = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+                with torch.no_grad():
+                    with ctx: # Use the same autocast context
+                        y_sample = raw_model.generate(x_sample, sample_max_new_tokens, temperature=sample_temperature, top_k=sample_top_k)
+                print(decode(y_sample[0].tolist()))
+                print("-------------------------")
+                raw_model.train() # Set model back to train mode
+            # ---- GENERATION END ----
 
-                if wandb_log:
-                    wandb.log({
-                        "iter": iter_num,
-                        "train/loss": losses['train'],
-                        "val/loss": losses['val'],
-                        "lr": lr,
-                        "mfu": running_mfu*100, # convert to percentage
-                    })
-                if losses['val'] < best_val_loss or always_save_checkpoint:
-                    best_val_loss = losses['val']
-                    if iter_num > 0:
-                        with record_function("save_checkpoint"):
-                            checkpoint = {
-                                'model': raw_model.state_dict(),
-                                'optimizer': optimizer.state_dict(),
-                                'model_args': model_args,
-                                'iter_num': iter_num,
-                                'best_val_loss': best_val_loss,
-                                'config': config,
-                            }
-                            print(f"saving checkpoint to {out_dir}")
-                            torch.save(checkpoint, os.path.join(out_dir, ckpt_name))
-            if iter_num == 0 and eval_only:
-                break
+            if wandb_log:
+                wandb.log({
+                    "iter": iter_num,
+                    "train/loss": losses['train'],
+                    "val/loss": losses['val'],
+                    "lr": lr,
+                    "mfu": running_mfu*100, # convert to percentage
+                })
+            if losses['val'] < best_val_loss or always_save_checkpoint:
+                best_val_loss = losses['val']
+                if iter_num > 0:
+                    checkpoint = {
+                        'model': raw_model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'model_args': model_args,
+                        'iter_num': iter_num,
+                        'best_val_loss': best_val_loss,
+                        'config': config,
+                    }
+                    print(f"saving checkpoint to {out_dir}")
+                    torch.save(checkpoint, os.path.join(out_dir, ckpt_name))
+        if iter_num == 0 and eval_only:
+            break
 
-            # forward backward update, with optional gradient accumulation to simulate larger batch size
-            # and using the GradScaler if data type is float16
-            for micro_step in range(gradient_accumulation_steps):
-                with record_function("microstep"):
-                    if ddp:
-                        # in DDP training we only need to sync gradients at the last micro step.
-                        # the official way to do this is with model.no_sync() context manager, but
-                        # I really dislike that this bloats the code and forces us to repeat code
-                        # looking at the source of that context manager, it just toggles this variable
-                        model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
-                    with ctx:
-                        with record_function("forward"):
-                            logits, loss = model(X, Y)
-                        loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-                    # immediately async prefetch next batch while model is doing the forward pass on the GPU
-                    with record_function("get_batch"):
-                        X, Y = get_batch('train')
-                    # backward pass, with gradient scaling if training in fp16
-                    with record_function("backward"):
-                        scaler.scale(loss).backward()
+        # forward backward update, with optional gradient accumulation to simulate larger batch size
+        # and using the GradScaler if data type is float16
+        for micro_step in range(gradient_accumulation_steps):
+            if ddp:
+                # in DDP training we only need to sync gradients at the last micro step.
+                # the official way to do this is with model.no_sync() context manager, but
+                # I really dislike that this bloats the code and forces us to repeat code
+                # looking at the source of that context manager, it just toggles this variable
+                model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+            with ctx:
+                logits, _ = model(X, Y) # Get logits only
+                # Calculate loss with label smoothing
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), Y.view(-1), ignore_index=-1, label_smoothing=label_smoothing)
+                loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+            # immediately async prefetch next batch while model is doing the forward pass on the GPU
+            X, Y = get_batch('train')
+            # backward pass, with gradient scaling if training in fp16
+            scaler.scale(loss).backward()
 
-            # clip the gradient
-            if grad_clip != 0.0:
-                with record_function("grad_clip"):
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            # step the optimizer and scaler if training in fp16
-            with record_function("optimizer_step"):
-                scaler.step(optimizer)
-                scaler.update()
-            # flush the gradients as soon as we can, no need for this memory anymore
-            optimizer.zero_grad(set_to_none=True)
+        # clip the gradient
+        if grad_clip != 0.0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        # step the optimizer and scaler if training in fp16
+        scaler.step(optimizer)
+        scaler.update()
+        # flush the gradients as soon as we can, no need for this memory anymore
+        optimizer.zero_grad(set_to_none=True)
 
         # timing and logging
         t1 = time.time()
@@ -532,16 +399,11 @@ try:
                 running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
             print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
 
-        # --- Debug Step Increment ---
-        # if master_process: # Only increment/print on master process
-        #     increment_debug_step()
-        # --------------------------
-
         iter_num += 1
         local_iter_num += 1
 
         if master_process:
-            prof.step()  # Record the profiling step
+            pass # profiler removed
 
         # termination conditions
         if iter_num > max_iters:
@@ -549,7 +411,7 @@ try:
 
 finally:
     if master_process:
-        prof.stop()  # Make sure we stop the profiler even if there's an error
+        pass # profiler removed
 
 if ddp:
     destroy_process_group()
