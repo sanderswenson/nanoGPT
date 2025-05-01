@@ -1,0 +1,23 @@
+John Gerving, Now
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nanogpt
+spec:
+  template:
+    spec:
+      containers:
+      - name: nanogpt
+        image: perl
+        command: ["perl",  "-Mbignum=bpi", "-wle", "print bpi(2000)"]
+        resources:
+           limits:
+             memory: 8Gi
+             cpu: 2
+             gpu: 2
+           requests:
+             memory: 8Gi
+             cpu: 2
+             gpu: 2
+      restartPolicy: Never
+  backoffLimit: 4

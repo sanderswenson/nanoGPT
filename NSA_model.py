@@ -190,13 +190,19 @@ class NativeSparseAttention(nn.Module):
         assert self.block_length > 0, "block_length must be > 0"
         assert self.stride_length > 0, "stride_length must be > 0"
 
-        # Compression MLP (using the new block-based implementation)
-        self.comp_mlp = CompressionMLP(config)  # for keys
-        self.comp_mlp_v = CompressionMLP(config)  # for values
+        # Compression MLP replaced by pooling
+        # self.comp_mlp = CompressionMLP(config)  # for keys # REMOVED
+        # self.comp_mlp_v = CompressionMLP(config)  # for values # REMOVED
 
-        # LayerNorms for combining pathways
-        self.ln_local = LayerNorm(config.n_embd, bias=config.bias)
-        self.ln_comp = LayerNorm(config.n_embd, bias=config.bias)
+        # Removing gating MLPs and combination LayerNorms
+        # self.gate_mlp_local = common_per_token_gate_layers()
+        # self.gate_mlp_comp = common_per_token_gate_layers()
+        # self.ln_local = LayerNorm(self.hs, bias=config.bias)
+        # self.ln_comp = LayerNorm(self.hs, bias=config.bias)
+
+        # Learnable default K/V for short sequences (T < block_length)
+        self.default_k_comp = nn.Parameter(torch.randn(1, self.n_head, 1, self.hs))
+        self.default_v_comp = nn.Parameter(torch.randn(1, self.n_head, 1, self.hs))
 
         # flash attention support
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
@@ -231,30 +237,8 @@ class NativeSparseAttention(nn.Module):
         k_comp_raw = k_comp_raw.view(B, T, self.n_head, hs).transpose(1, 2) # (B, nh, T_comp, hs)
         v_comp_raw = v_comp_raw.view(B, T, self.n_head, hs).transpose(1, 2) # (B, nh, T_comp, hs)
 
-
-
-####################### Restoring Compressed Path #######################
-
-
-        # 2. Compression (using k_comp_raw, v_comp_raw)
-        # Apply compression MLP directly (unfold is now handled inside the MLP)
-        k_comp = self.comp_mlp(k_comp_raw) # (B, nh, num_blocks, hs)
-        v_comp = self.comp_mlp_v(v_comp_raw) # (B, nh, num_blocks, hs)
-
-
-#######################
-
-
-        # Get the number of blocks for later use
-        if T < self.block_length:
-            num_blocks = 0
-            T_comp = 0
-        else:
-            num_blocks = k_comp.size(2)
-            T_comp = num_blocks
-            
-
         # 4. Calculate Local Attention (using q, k_local, v_local)
+        # TODO: Double check masks!
         attn_mask_local = self.local_causal_allow_mask[:, :, :T, :T].expand(B, self.n_head, T, T)
         if self.flash and attn_mask_local.device.type == 'cuda':
             # ... (flash attention for local - unchanged) ...
@@ -284,68 +268,76 @@ class NativeSparseAttention(nn.Module):
             att_local = self.attn_dropout(att_local)
             y_local = att_local @ v_local # (B, nh, T, hs)
 
+        # 5. Calculate Compressed Attention (persistent default K/V)
+        
+        # Expand default K/V to batch size
+        default_k_expanded = self.default_k_comp.expand(B, -1, -1, -1)
+        default_v_expanded = self.default_v_comp.expand(B, -1, -1, -1)
 
-
-
-
-        # 5. Calculate Compressed Attention (using q, k_comp, v_comp)
-        if num_blocks > 0:
-            # Manual implementation with causal masking
-            scale = 1.0 / math.sqrt(k_comp.size(-1)) # Standard scaling by sqrt(key_dim)
-            att_comp = (q @ k_comp.transpose(-2, -1)) * scale  # Shape (B, nh, T, T_comp)
-            "Something right here... gradient is not backpropagating much"
-
-            # --- Build Causal Mask for Compressed Attention ---
-            # For causal attention, each query token at time step t should only attend to compressed blocks whose start index is <= t.
-            # We compute two tensors:
-            #   query_indices: a (T, 1) tensor containing [0, 1, ..., T-1], where T is the sequence length.
-            #   block_start_indices: a (1, T_comp) tensor with values [0, stride_length, 2*stride_length, ...],
-            #       representing the approximate starting index of each compressed block.
-            # The allowed condition is: block_start_indices[j] <= query_indices[t]. We then invert this allowed mask
-            # to obtain positions that should be masked (set to -inf) in the attention scores.
-            query_indices = torch.arange(q.size(2), device=q.device).unsqueeze(1)  # Shape: (T, 1)
-            block_start_indices = torch.arange(att_comp.size(-1), device=q.device).unsqueeze(0) * self.stride_length  # Shape: (1, T_comp)
-            allowed_mask = block_start_indices <= query_indices  # Shape: (T, T_comp); True where attention is allowed
-            causal_mask = ~allowed_mask  # Invert: True where attention should be masked out
-            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # Expand to match att_comp shape (B, nh, T, T_comp)
-            # --- End of Causal Mask Construction ---
-            # print(f"causal_mask: {causal_mask.shape}")
-            # print(f"boolean: {causal_mask[0,0,:10,:10]}")
-
-            # Apply the causal mask to the compressed attention scores
-            att_comp = att_comp.masked_fill(causal_mask, float('-inf'))
-
-            # Continue with softmax and value aggregation
-            att_comp = F.softmax(att_comp, dim=-1)
-            # Replace NaN values that can arise from rows being all -inf after masking (query attends to no blocks)
-            att_comp = torch.nan_to_num(att_comp)
-            att_comp = self.attn_dropout(att_comp)
-            y_comp = att_comp @ v_comp # (B, nh, T, hs)
+        if T < self.block_length:
+            # Only default K/V available
+            k_combined = default_k_expanded
+            v_combined = default_v_expanded
+            num_pooled_blocks = 0
         else:
-            y_comp = None # Indicate no compressed output calculated
+            # --- Pooling --- 
+            k_unfolded = k_comp_raw.unfold(dimension=2, size=self.block_length, step=self.stride_length)
+            k_comp_pooled = k_unfolded.mean(dim=-1)
+            v_unfolded = v_comp_raw.unfold(dimension=2, size=self.block_length, step=self.stride_length)
+            v_comp_pooled = v_unfolded.mean(dim=-1)
+            num_pooled_blocks = k_comp_pooled.size(2)
+            # --- End Pooling ---
             
+            # Concatenate default K/V with pooled K/V
+            k_combined = torch.cat((default_k_expanded, k_comp_pooled), dim=2)
+            v_combined = torch.cat((default_v_expanded, v_comp_pooled), dim=2)
+            
+        T_comp_combined = 1 + num_pooled_blocks # Total effective blocks
 
-
-
-
-        # 6. Combine Local and Compressed Attentions via Addition
-        # NOTE: LayerNorms are so vital. 
-        y_local_flat = y_local.transpose(1, 2).contiguous().view(B, T, -1)
-
-        # Apply LayerNorm before combining
-        y_local_flat = self.ln_local(y_local_flat)
-
-        # Combine normalized paths
-        # TODO: add gating again.
-        if y_comp is not None: # Check if compressed path was active
-            y_comp_flat = y_comp.transpose(1, 2).contiguous().view(B, T, -1)
-            y_comp_flat = self.ln_comp(y_comp_flat) # Normalize if exists
-            y_combined_flat = y_local_flat + y_comp_flat # Add normalized components
+        # --- Calculate Attention Scores ---
+        scale = 1.0 / math.sqrt(k_combined.size(-1)) # Scale by head dim
+        # Score shape: (B, nh, T, hs) @ (B, nh, hs, T_comp_combined) -> (B, nh, T, T_comp_combined)
+        att_comp = (q @ k_combined.transpose(-2, -1)) * scale
+        
+        # --- Build Combined Causal Mask --- 
+        query_indices = torch.arange(q.size(2), device=q.device).unsqueeze(1)  # Shape: (T, 1)
+        
+        # Mask for the default K/V (always allowed -> False)
+        default_mask = torch.zeros((q.size(2), 1), dtype=torch.bool, device=q.device) # Shape (T, 1)
+        
+        if num_pooled_blocks > 0:
+            # Mask for pooled blocks (standard causal block mask)
+            block_start_indices = torch.arange(num_pooled_blocks, device=q.device).unsqueeze(0) * self.stride_length # Shape: (1, num_pooled_blocks)
+            allowed_mask_pooled = block_start_indices <= query_indices  # Shape: (T, num_pooled_blocks)
+            pooled_mask = ~allowed_mask_pooled # True where masked
+            # Concatenate masks
+            final_mask = torch.cat((default_mask, pooled_mask), dim=1) # Shape (T, T_comp_combined)
         else:
-            y_combined_flat = y_local_flat # Use only normalized local path
+            # Only the default mask exists
+            final_mask = default_mask # Shape (T, 1)
+            
+        # Expand final mask for broadcasting
+        final_mask = final_mask.unsqueeze(0).unsqueeze(0) # Shape (1, 1, T, T_comp_combined)
+        
+        # Apply the combined causal mask
+        # Ensure slicing/expansion handles T_comp_combined correctly
+        att_comp = att_comp.masked_fill(final_mask[:,:,:T,:T_comp_combined].expand_as(att_comp), float('-inf'))
+
+        # --- Softmax and Value Aggregation ---
+        att_comp = F.softmax(att_comp, dim=-1)
+        att_comp = torch.nan_to_num(att_comp) # Handle potential NaNs if a row is fully masked (shouldn't happen with default K/V)
+        att_comp = self.attn_dropout(att_comp)
+        y_comp = att_comp @ v_combined # (B, nh, T, hs)
+        # ---------------------------------------------------
+             
+        # 6. Combine Local and Compressed Attentions via Simple Addition
+        y_combined = y_comp + y_local 
+
+        # Reshape combined output for the final projection
+        y = y_combined.transpose(1, 2).contiguous().view(B, T, C) # Reshaping happens here
 
         # NOTE: Output projection layer (c_proj) input dimension is C
-        y = y_combined_flat
+        # y = y_combined_flat # Use the reshaped y
 
         # 7. Final Output Projection
         y = self.resid_dropout(self.c_proj(y))
@@ -379,7 +371,7 @@ class GPTConfig:
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     # NSA parameters
     # Should be context size/16 according to the paper
-    local_window_size: int = 12  # Size of the local attention window
+    local_window_size: int = 16  # Size of the local attention window
     # Should be context size/64 according to the paper
     block_length: int = 2  # Length of each block for sliding window compression
     # These should be equal for now

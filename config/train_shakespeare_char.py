@@ -1,10 +1,18 @@
 # train a miniature character-level shakespeare model
 # good for debugging and playing on macbooks and such
 
+# NSA parameters
+# Should be context size/16 according to the paper
+local_window_size: int = 16  # Size of the local attention window
+# Should be context size/64 according to the paper
+block_length: int = 2  # Length of each block for sliding window compression
+# These should be equal for now
+stride_length: int = 2  # Stride between consecutive blocks for sliding window compression
+
 out_dir = 'out-shakespeare-char'
 eval_interval = 250 # keep frequent because we'll overfit
 eval_iters = 200
-log_interval = 10 # don't print too too often
+log_interval = 25 # don't print too too often
 
 # we expect to overfit on this small dataset, so only save when val improves
 always_save_checkpoint = False
@@ -14,7 +22,7 @@ wandb_project = 'shakespeare-char'
 wandb_run_name = 'mini-gpt'
 
 dataset = 'shakespeare_char'
-gradient_accumulation_steps = 1
+gradient_accumulation_steps = 4 # Changed from 1 to be divisible by 4 GPUs
 batch_size = 64
 block_size = 256 # context of up to 256 previous characters
 
@@ -22,11 +30,11 @@ block_size = 256 # context of up to 256 previous characters
 n_layer = 6
 n_head = 6
 n_embd = 384
-dropout = 0.2
+dropout = 0.4
 
-learning_rate = 1e-3 # with baby networks can afford to go a bit higher
-max_iters = 5000
-lr_decay_iters = 5000 # make equal to max_iters usually
+learning_rate = 1e-4 # with baby networks can afford to go a bit higher
+max_iters = 50000
+lr_decay_iters = 50000 # make equal to max_iters usually
 min_lr = 1e-4 # learning_rate / 10 usually
 beta2 = 0.99 # make a bit bigger because number of tokens per iter is small
 

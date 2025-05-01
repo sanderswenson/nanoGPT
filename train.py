@@ -59,10 +59,10 @@ block_size = 1024
 n_layer = 12
 n_head = 12
 n_embd = 768
-dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
+dropout = 0.2 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # LabelSmoothing
-label_smoothing = 0.05
+label_smoothing = 0.0
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -85,9 +85,15 @@ compile = True # use PyTorch 2.0 to compile the model to be faster
 sample_max_new_tokens = 100
 sample_temperature = 0.8
 sample_top_k = 200
-sample_start = "First Citizen:\nWe are accounted poor citizens, the patricians good.\nWhat authority surfeits on would relieve us: if they\nwould yield us but the superfluity, while it were\nwholesome, we might guess they relieved us humanely;\nbut they think we are too dear: the leanness that\nafflicts us, the object of our misery, is as an\ninventory to particularise their abundance;\nour sufferance is a gain to them Let us revenge this with\nour pikes, ere we become rakes: for the gods know I\n speak this in hunger for bread, not \n" # Start prompt for sampling    
+sample_start = "First Citizen:\nWe are accounted poor citizens, the patricians good.\nWhat authority surfeits on would relieve us: if they\nwould yield us but the superfluity, while it were\nwholesome, we might guess they relieved us humanely;\nbut they think we are too dear: the leanness that\nafflicts us, the object of our misery, is as an\ninventory to particularise their abundance;\nour sufferance is a gain to them Let us revenge this with\nour pikes, ere we become rakes: for the gods know I\nspeak this in hunger for bread, not" # Start prompt for sampling    
+# --- New Fixed Short Sequence Training --- 
+short_ratio = 2
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
+# Ensure local_window_size is included if defined globally
+if 'local_window_size' in globals() and 'local_window_size' not in config_keys:
+    config_keys.append('local_window_size')
+
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
@@ -127,10 +133,10 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
-# probability of sampling a short sequence
-p_short_seq = 0.0
+# Removed random short sequence probability logic
+p_short_seq = 0.0 # Keeping this at 0.0
 
-def get_batch(split):
+def get_batch(split, iter_num=None, force_length=None):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
     if split == 'train':
@@ -139,13 +145,21 @@ def get_batch(split):
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
     # Decide sequence length for this batch
-    if split == 'train' and np.random.rand() < p_short_seq:
-        # Sample a short sequence length
-        t = torch.randint(1, block_size, (1,)).item() # T_actual between 1 and block_size-1
-    else:
-        # Use full block size
-        t = block_size
+    t = block_size # Default to full block size
+    if split == 'train' and iter_num is not None and iter_num % short_ratio == 0:
+        # Use fixed short sequence length every short_ratio iterations
+        global local_window_size
+        t = local_window_size
 
+    # Override length if force_length is provided (used for eval)
+    if force_length is not None:
+        t = force_length
+
+    # Ensure t is valid
+    t = min(t, block_size)
+    t = max(t, 1)
+
+    # Sample data indices
     ix = torch.randint(len(data) - t, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+t]).astype(np.int64)) for i in ix]) # Shape (B, t)
     y = torch.stack([torch.from_numpy((data[i+1:i+1+t]).astype(np.int64)) for i in ix]) # Shape (B, t)
@@ -285,7 +299,7 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
+X, Y = get_batch('train', iter_num=iter_num) # fetch the very first batch, pass iter_num
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
@@ -375,7 +389,8 @@ try:
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), Y.view(-1), ignore_index=-1, label_smoothing=label_smoothing)
                 loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
-            X, Y = get_batch('train')
+            # Pass iter_num to get_batch for training batches
+            X, Y = get_batch('train', iter_num=iter_num)
             # backward pass, with gradient scaling if training in fp16
             scaler.scale(loss).backward()
 
@@ -415,6 +430,6 @@ try:
 finally:
     if master_process:
         pass # profiler removed
-
-if ddp:
-    destroy_process_group()
+    # Move the cleanup here
+    if ddp:
+        destroy_process_group()

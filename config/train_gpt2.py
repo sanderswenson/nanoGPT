@@ -2,6 +2,14 @@
 # launch as the following (e.g. in a screen session) and wait ~5 days:
 # $ torchrun --standalone --nproc_per_node=8 train.py config/train_gpt2.py
 
+# NSA parameters
+# Should be context size/16 according to the paper
+local_window_size: int = 16  # Size of the local attention window
+# Should be context size/64 according to the paper
+block_length: int = 2  # Length of each block for sliding window compression
+# These should be equal for now
+stride_length: int = 2  # Stride between consecutive blocks for sliding window compression
+
 wandb_log = True
 wandb_project = 'owt'
 wandb_run_name='gpt2-124M'
