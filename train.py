@@ -61,6 +61,13 @@ n_head = 12
 n_embd = 768
 dropout = 0.2 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+# NSA parameters
+# Should be context size/16 according to the paper
+local_window_size: int = 16  # Size of the local attention window
+# Should be context size/64 according to the paper
+block_length: int = 2  # Length of each block for sliding window compression
+# These should be equal for now
+stride_length: int = 2  # Stride between consecutive blocks for sliding window compression
 # LabelSmoothing
 label_smoothing = 0.0
 # adamw optimizer
@@ -149,7 +156,7 @@ def get_batch(split, iter_num=None, force_length=None):
     if split == 'train' and iter_num is not None and iter_num % short_ratio == 0:
         # Use fixed short sequence length every short_ratio iterations
         global local_window_size
-        t = local_window_size
+        t = local_window_size * 3
 
     # Override length if force_length is provided (used for eval)
     if force_length is not None:
@@ -191,7 +198,11 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout,
+                  local_window_size=local_window_size, block_length=block_length, stride_length=stride_length) # Added LC params
+print(f"Model parameters: n_layer={n_layer}, n_head={n_head}, n_embd={n_embd}, block_size={block_size}, "
+      f"local_window_size={local_window_size}, block_length={block_length}, stride_length={stride_length}, "
+      f"dropout={dropout}")
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -420,16 +431,10 @@ try:
         iter_num += 1
         local_iter_num += 1
 
-        if master_process:
-            pass # profiler removed
-
         # termination conditions
         if iter_num > max_iters:
             break
 
 finally:
-    if master_process:
-        pass # profiler removed
-    # Move the cleanup here
     if ddp:
         destroy_process_group()
